@@ -1,0 +1,15 @@
+{
+	"authors": [
+		"Kyle Ingraham"
+	],
+	"copyright": "Copyright © 2024, Kyle Ingraham",
+	"dependencies": {
+		"hutia": {
+			"version": "*",
+			"path": "../../"
+		},
+	},
+	"description": "Demonstrates a web app using hutia",
+	"license": "MIT",
+	"name": "hutia-simple-app-example",
+}

@@ -1,0 +1,29 @@
+# Development artifacts
+.dub
+dub.selections.json
+docs.json
+__dummy.html
+docs/
+/hutia
+libhutia*.so
+libhutia*.dylib
+libhutia*.dll
+libhutia*.a
+libhutia*.lib
+hutia*.lib
+hutia-test-*
+*.exe
+*.pdb
+*.o
+*.obj
+*.lst
+*.dll
+
+# Project examples
+*-example
+
+# OS files
+.DS_Store
+
+# Vagrant
+.vagrant

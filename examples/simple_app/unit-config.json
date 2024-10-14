@@ -1,0 +1,13 @@
+{
+    "listeners": {
+        "*:8081": {
+            "pass": "applications/simple-app"
+        }
+    },
+    "applications": {
+        "simple-app": {
+            "type": "external",
+            "executable": "<dub output directory>/hutia-simple-app-example",
+        }
+    }
+}
