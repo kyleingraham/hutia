@@ -76,7 +76,7 @@ package void unitRequestHandler(nxt_unit_request_info_t* requestInfo) @safe
 {
 	auto httpContext = HttpContext.create(requestInfo);
 	scope (exit) httpContext.response.complete();
-	auto webAppContext = (() @trusted => cast(WebApplicationContext*)requestInfo.ctx.data)();
+	auto webAppContext = (() @trusted => cast(WebApplicationContext*)requestInfo.ctx.data)(); // TODO: shared handler?
 	try
 	{
 		httpContext.response.body.write(
@@ -99,12 +99,6 @@ extern(C)
 package int unitReadyHandler(nxt_unit_ctx_t* unitContext) @safe
 {
 	return NXT_UNIT_OK;
-}
-
-package void appWorker(nxt_unit_ctx_t* unitContext) @trusted
-{
-	nxt_unit_run(unitContext);
-	nxt_unit_done(unitContext);
 }
 
 package void logUnit(nxt_unit_ctx_t* unitContext, UnitLogLevel logLevel, string message) @trusted

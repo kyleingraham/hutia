@@ -48,7 +48,7 @@ Hutia first initializes a `nxt_unit_init_t` struct. This struct contains a `call
     - Purpose: Called after Unit is ready. Here you can perform further application setup e.g. [spawn worker threads](https://github.com/nginx/unit/blob/cc2a1cc3651593fbc5ede99ceab8161c364998f3/src/test/nxt_unit_app_test.c#L110). Return `NXT_UNIT_OK` on success. Unit will loop forever should you return `NXT_UNIT_ERROR` (why this happens is unclear).
     - Required?: No.
 
-All other callbacks are optional and I am unclear on their purposes.
+All other callbacks are optional but I am unclear on their purposes.
 
 After setting up callbacks, Hutia calls `nxt_unit_init` with a reference to the `nxt_unit_init_t` struct. `nxt_unit_init` returns a `nxt_unit_ctx_t*` context struct that will be null on failure. Hutia will abort in this case. If the struct is valid, Hutia stores its own context data on the struct's `void*` `data` member.
 
@@ -75,6 +75,14 @@ On the field returned, Hutia fetches header key/value strings using `name`, `nam
 The overall flow for reading the request body is to, in a loop:
 - Determine how much of the request body is available to be read.
 - Read the available request body into your own buffer until Unit reports that there is no more body to read.
+
+To determine how much of the request body is available to be read, Hutia first tries to read the request's content length. If that is not available, it checks Unit's buffers directly. 
+
+Unit stores content length as a `nxt_unit_field_t*` at `nxt_unit_request_info_t.request.content_length_field` with a value of `NXT_UNIT_NONE_FIELD` if no content length is available. If one is available, Hutia reads it the same way header fields are. The difference in this case is that the offset is `content_length_field` and the only `value` and `value_length` need to be used.
+
+Unit stores body data that is ready for reading in a linked list of buffers starting at `nxt_unit_request_info_t.content_buf`. When there is no content length, Hutia traverses this list until a `null` buffer is found using `nxt_unit_buf_next`. At each buffer Hutia sums `buffer.end - buffer.free`. 
+
+Once Hutia has successfully determined how much response body is available, it creates a buffer of appropriate length, copies into it using `nxt_unit_request_read`, then repeats the process of determing body bytes available and copying those bytes into Hutia's buffers until no more body bytes are present.
 
 *Response Metadata*  
 TODO
