@@ -97,7 +97,7 @@ To initialize the response, Hutia calls `nxt_unit_response_init`. In addition to
 
 Once the response is initialized, Hutia then writes header values using `nxt_unit_response_add_field` supplying a `nxt_unit_request_info_t*`, a header key null-terminated string and its length, and a header value null-terminated string and its length. As above, errors here result in calls to `nxt_unit_request_done`.
 
-After all header values have been set, Huta calls `nxt_unit_response_send` to begin sending ready request components to the client.
+After all header values have been set, Hutia calls `nxt_unit_response_send` to begin sending ready request components to the client.
 
 #### Response Body  
 To write and send the response body, Hutia uses Unit's callback-based `nxt_unit_response_write_cb` method. One difficult part about writing responses in Unit is knowing when Unit is ready to accept data. `nxt_unit_response_write_cb` inverts control of when writes happen by accepting a callback for writing data at times that Unit chooses.  
