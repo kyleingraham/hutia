@@ -7,10 +7,10 @@ import vibe.stream.operations : readAllUTF8;
 
 int main(string[] args) @safe
 {
-	auto app = WebApplication.create();
-	return app
-	       .map("", &handler) // map doesn't do any routing today and only supports setting a single handler app-wide.
-	       .run();
+    auto app = WebApplication.create();
+    return app
+           .map("", &handler) // map doesn't do any routing today and only supports setting a single handler app-wide.
+           .run();
 }
 
 // We need extern(C) here to satisfy an implementation detail of hutia's NGINX Unit integration.
@@ -18,23 +18,23 @@ int main(string[] args) @safe
 extern(C)
 string handler(HttpContext httpContext) @safe
 {
-	auto httpRequest = httpContext.request;
+    auto httpRequest = httpContext.request;
 
-	try
-	{
-		auto requestBody = httpRequest.body.readAllUTF8();
-	} catch (UTFException e) {
-		auto message = (() @trusted => format("handler - %s", e))();
-		logError(httpContext, message); // D's standard library logger locks Unit. Looks to cause busy-waiting.
-	}
+    try
+    {
+        auto requestBody = httpRequest.body.readAllUTF8();
+    } catch (UTFException e) {
+        auto message = (() @trusted => format("handler - %s", e))();
+        logError(httpContext, message); // D's standard library logger locks Unit. Looks to cause busy-waiting.
+    }
 
-	auto httpResponse = httpContext.response;
-	httpResponse.statusCode = 200;
-	httpResponse.headers.addField("Content-Type", "text/html; charset=utf-8");
+    auto httpResponse = httpContext.response;
+    httpResponse.statusCode = 200;
+    httpResponse.headers.addField("Content-Type", "text/html; charset=utf-8");
 
-	Appender!string response;
+    Appender!string response;
 
-	response.put(`<!DOCTYPE html>
+    response.put(`<!DOCTYPE html>
 <html lang="en">
 <head></head>
 <body>
@@ -42,22 +42,22 @@ string handler(HttpContext httpContext) @safe
     <p>Here are some random strings:</p>
 `);
 
-	foreach (_; 0..10)
-	{
-		response.put(`    <p>` ~ randomString() ~ `</p>
+    foreach (_; 0..10)
+    {
+        response.put(`    <p>` ~ randomString() ~ `</p>
 `);
-	}
+    }
 
-	response.put(`</body>
+    response.put(`</body>
 </html>
 `);
 
-	return response.data;
+    return response.data;
 }
 
 string randomString(uint length = 12) @safe
 {
-	const char[] charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const char[] charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     Appender!string result;
     
     foreach (_; 0..length)
