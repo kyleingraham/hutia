@@ -621,7 +621,7 @@ package int sendResponse(nxt_unit_request_info_t* requestInfo, string response) 
 }
 
 extern(C)
-package ptrdiff_t writeResponseCallback(nxt_unit_read_info_t *readInfo, void *destination, size_t size) @safe
+package ptrdiff_t writeResponseCallback(nxt_unit_read_info_t* readInfo, void* destination, size_t size) @safe
 {
 	auto data = (() @trusted => cast(ResponseData*)readInfo.data)();
 
