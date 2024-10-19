@@ -8,6 +8,7 @@
         "simple-app": {
             "type": "external",
             "executable": "<dub output directory>/hutia-simple-app-example",
+            "processes": 1,
         }
     }
 }

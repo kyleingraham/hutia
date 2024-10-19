@@ -8,7 +8,7 @@ import std.conv : to;
 import std.exception : enforce;
 import std.format : format;
 import std.string : toStringz;
-import std.typecons : Nullable;
+import std.typecons : Nullable, Tuple;
 import unit_integration;
 import vibe.container.dictionarylist : DictionaryList;
 import vibe.core.stream : InputStream;
@@ -69,22 +69,30 @@ package int runUnit(WebApplicationContext* webAppContext) @system
 extern(C)
 package void unitRequestHandler(nxt_unit_request_info_t* requestInfo) @safe
 {
-    auto httpContext = HttpContext.create(requestInfo);
-    scope (exit) httpContext.response.complete();
-    auto webAppContext = (() @trusted => cast(WebApplicationContext*)requestInfo.ctx.data)(); // TODO: shared handler?
+    auto httpContext = HttpContext.allocate(requestInfo);
+    scope (exit)
+    {
+        httpContext.response.complete();
+        HttpContext.deallocate(httpContext);
+    }
+    auto webAppContext = (() @trusted => cast(WebApplicationContext*)requestInfo.ctx.data)();
     try
     {
         httpContext.response.body.write(
-            webAppContext.handler(httpContext)
+            webAppContext.handler(httpContext) // TODO: shared handler?
         );
     }
     catch (Exception e)
     {
-        // Any uncaught exception while writing the repsonse should result in the request being finalized gracefully.
-        // Ideally there is another layer above this ensuring the status code is updated to a 500.
-        // Uncaught exceptions will break Unit.
+        // Any uncaught exception while writing the repsonse should result in the request 
+        // being finalized gracefully. Ideally there is another layer above this ensuring 
+        // the status code is updated to a 500. Uncaught exceptions will break Unit.
         auto responseSent = (() @trusted => nxt_unit_response_is_sent(requestInfo))();
-        logUnit(requestInfo.ctx, UnitLogLevel.debug_, format("unitRequestHandler - Response sent? %s", responseSent));
+        logUnit(
+            requestInfo.ctx,
+            UnitLogLevel.debug_,
+            format("unitRequestHandler - Response sent? %s", cast(bool)responseSent)
+        );
         auto message = (() @trusted => format("unitRequestHandler - %s", e))();
         logUnit(requestInfo.ctx, UnitLogLevel.error, message);
     }
@@ -96,7 +104,11 @@ package int unitReadyHandler(nxt_unit_ctx_t* unitContext) @safe
     return NXT_UNIT_OK;
 }
 
-package void logUnit(nxt_unit_ctx_t* unitContext, UnitLogLevel logLevel, string message) @trusted
+package void logUnit(
+    nxt_unit_ctx_t* unitContext,
+    UnitLogLevel logLevel,
+    string message
+) @trusted
 {
     nxt_unit_log(unitContext, logLevel, ("[D] " ~ message).toStringz);
 }
@@ -146,61 +158,172 @@ package enum UnitLogLevel : uint
     {
         return response_;
     }
+
+    // Free List
+
+    /**
+       This free list requires implementation of 3 methods:
+           - an `initialize` method
+               - Should make the object ready for a request.
+                 Returns void and should accept all required arguments for initialization.
+           - a `reset` method
+               - Resets an object to an uninitialized, but allocated state. The object
+                 should have no remnants of the last request it participated in.
+                 Returns void and accepts no arguments.
+       */
+
+    static HttpContext freeList;
+
+    static HttpContext allocate(nxt_unit_request_info_t* requestInfo)
+    {
+        HttpContext httpContext;
+
+        if (freeList)
+        {
+            httpContext = freeList;
+            freeList = httpContext.next;
+            httpContext.initialize(requestInfo);
+        }
+        else
+            httpContext = HttpContext.create(requestInfo);
+
+        return httpContext;
+    }
+
+    static void deallocate(HttpContext httpContext)
+    {
+        httpContext.reset();
+        httpContext.next = freeList;
+        freeList = httpContext;
+    }
+
+    HttpContext next;
+
+    // Memory management methods
+
+    private void initialize(nxt_unit_request_info_t* requestInfo)
+    {
+        request_.initialize(requestInfo);
+        response_.initialize(requestInfo);
+    }
+
+    private void reset()
+    {
+        request_.reset();
+        response_.reset();
+    }
 }
 
 @safe class HttpRequest
 {
-    immutable string path;
-    immutable string method;
-    immutable HttpHeadersDictionary headers;
     private 
     {    
-        InputStream _body;
+        InputStream body_;
+        HttpHeadersDictionary headers_;
+        string path_;
+        string method_;
         nxt_unit_request_info_t* requestInfo;
     }
 
-    private this(nxt_unit_request_info_t* requestInfo, string path, string method, HttpHeadersDictionary headers)
+    private this(
+        nxt_unit_request_info_t* requestInfo,
+        string path,
+        string method,
+        HttpHeadersDictionary headers
+    )
     {
         this.requestInfo = requestInfo;
-        this.path = path;
-        this.method = method;
-        this.headers = (() @trusted => cast(immutable(HttpHeadersDictionary))headers)();
-        _body = new HttpRequestBodyStream(this.requestInfo);
+        path_ = path;
+        method_ = method;
+        headers_ = headers;
+        body_ = new HttpRequestBodyStream(this.requestInfo);
+    }
+
+    private static RequestValues getRequestValues(
+        nxt_unit_request_info_t* requestInfo
+    )
+    {
+        auto unitRequest = requestInfo.request;
+        auto path = (() @trusted => getString(
+            &unitRequest.target, unitRequest.target_length
+        ))();
+        auto method = (() @trusted => getString(
+            &unitRequest.method, unitRequest.method_length
+        ))();
+        auto headers = getHeaders(unitRequest);
+
+        return RequestValues(
+            path, method, headers
+        );
     }
 
     static HttpRequest create(nxt_unit_request_info_t* requestInfo)
     {
-        auto unitRequest = requestInfo.request;
-        auto path = (() @trusted => getString(&unitRequest.target, unitRequest.target_length))();
-        auto method = (() @trusted => getString(&unitRequest.method, unitRequest.method_length))();
-        auto headers = getHeaders(unitRequest);
-        auto httpRequest =  new HttpRequest(requestInfo, path, method, headers);
+        auto requestValues = getRequestValues(requestInfo);
+        auto httpRequest =  new HttpRequest(
+            requestInfo,
+            requestValues.path,
+            requestValues.method,
+            requestValues.headers
+        );
+
         return httpRequest;
     }
 
     InputStream body()
     {
-        return _body;
+        return body_;
     }
 
     Nullable!ulong contentLength()
     {
-        string contentLength = this.headers.get("Content-Length");
+        string contentLength = headers_.get("Content-Length");
         if (contentLength == string.init)
             return Nullable!ulong();
 
         return Nullable!ulong(to!ulong(contentLength));
     }
 
+    string method()
+    {
+        return method_;
+    }
+
+    string path()
+    {
+        return path_;
+    }
+
     override string toString()
     {
         return "HttpRequest(\"" ~ method ~ "\", \"" ~ path ~ "\")";
     }
+
+    // Memory management methods
+
+    private void initialize(nxt_unit_request_info_t* requestInfo)
+    {
+        (cast(HttpRequestBodyStream)body_).initialize(requestInfo);
+        auto requestValues = getRequestValues(requestInfo);
+        path_ = requestValues.path;
+        method_ = requestValues.method;
+        headers_ = requestValues.headers;
+        this.requestInfo = requestInfo;
+    }
+
+    private void reset()
+    {
+        (cast(HttpRequestBodyStream)body_).reset();
+        headers_ = HttpHeadersDictionary.init;
+        path_ = string.init;
+        method_ = string.init;
+        nxt_unit_request_info_t* requestInfo = null;
+    }
 }
 
-package string getString(nxt_unit_sptr_t* serializedPointer, size_t length) @system
+package string getString(nxt_unit_sptr_t* stringPointer, size_t length) @system
 {
-    auto start = nxt_unit_sptr_get(serializedPointer);
+    auto start = nxt_unit_sptr_get(stringPointer);
     return cast(string)(start[0..length]);
 }
 
@@ -220,19 +343,24 @@ package HttpHeadersDictionary getHeaders(nxt_unit_request_t* unitRequest) @safe
     return headers;
 }
 
-package nxt_unit_field_t* getField(nxt_unit_request_t* unitRequest, size_t fieldOffset) @system
+package nxt_unit_field_t* getField(
+    nxt_unit_request_t* unitRequest,
+    size_t fieldOffset
+) @system
 {
     return cast(nxt_unit_field_t*)unitRequest.fields + fieldOffset;
 }
+
+alias RequestValues = Tuple!(string, "path", string, "method", HttpHeadersDictionary, "headers");
 
 package @safe class HttpRequestBodyStream : InputStream
 {
     private 
     {
-        nxt_unit_request_info_t* requestInfo;
         Nullable!ulong contentLength;
         bool isEmpty = false;
         ulong position;
+        nxt_unit_request_info_t* requestInfo;
     }
 
     this(nxt_unit_request_info_t* requestInfo)
@@ -248,7 +376,8 @@ package @safe class HttpRequestBodyStream : InputStream
 
     const(ubyte)[] peek()
     {
-        // Our stream has no internal buffer so we return an empty slice (as per the InputStream API).
+        // Our stream has no internal buffer so we return an empty
+        // slice (as per the InputStream API).
         return [];
     }
 
@@ -257,10 +386,14 @@ package @safe class HttpRequestBodyStream : InputStream
         if (empty)
             return 0;
 
-        auto bytesRead = (() @trusted => nxt_unit_request_read(requestInfo, dst.ptr, dst.length))();
+        auto bytesRead = (() @trusted => nxt_unit_request_read(
+            requestInfo, dst.ptr, dst.length
+        ))();
 
         if (bytesRead < 0)
-            throw new UnitRequestReadException("nxt_unit_request_read return code=" ~ to!string(bytesRead));
+            throw new UnitRequestReadException(
+                "nxt_unit_request_read return code=" ~ to!string(bytesRead)
+            );
 
         position += bytesRead;
 
@@ -291,6 +424,7 @@ package @safe class HttpRequestBodyStream : InputStream
     }
 
     // Deprecated InputStream interface members
+
     bool dataAvailableForRead()
     {
         return 0 < leastSize();
@@ -323,6 +457,22 @@ package @safe class HttpRequestBodyStream : InputStream
 
         // Otherwise, we return remainingBuffer bytes for further reading
         return remainingBuffer;
+    }
+
+    // Memory management methods
+
+    private void initialize(nxt_unit_request_info_t* requestInfo)
+    {
+        this.requestInfo = requestInfo;
+        this.contentLength = (() @trusted => getContentLength(requestInfo.request))();
+    }
+
+    private void reset()
+    {
+        requestInfo = null;
+        Nullable!ulong contentLength = Nullable!ulong();
+        isEmpty = false;
+        position = ulong.init;
     }
 }
 
@@ -409,14 +559,23 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
 
     private void writeHeaders() @system
     {    
-        enforce!InvalidOperationException(!hasStarted, "Cannot write headers for a request more than once");
+        enforce!InvalidOperationException(
+            !hasStarted,
+            "Cannot write headers for a request more than once"
+        );
 
         headers_.setDefault("Content-Type", "text/html; charset=utf-8");
 
         hasStarted_ = true;
 
-        enforce!InvalidOperationException(headers_.count < uint.max, "Header count larger than Unit's max");
-        enforce!InvalidOperationException(headers_.length < uint.max, "Header key value length larger than Unit's max");
+        enforce!InvalidOperationException(
+            headers_.count < uint.max,
+            "Header count larger than Unit's max"
+        );
+        enforce!InvalidOperationException(
+            headers_.length < uint.max,
+            "Header key value length larger than Unit's max"
+        );
 
         auto rc = nxt_unit_response_init(
             requestInfo_,
@@ -429,8 +588,14 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
 
         foreach(key, value; headers_.byKeyValue)
         {
-            enforce!InvalidOperationException(key.length < ubyte.max, format("Header key longer than Unit's max: %s", key));
-            enforce!InvalidOperationException(value.length < uint.max, format("Header value larger than Unit's max: %s", value));
+            enforce!InvalidOperationException(
+                key.length < ubyte.max,
+                format("Header key longer than Unit's max: %s", key)
+            );
+            enforce!InvalidOperationException(
+                value.length < uint.max,
+                format("Header value larger than Unit's max: %s", value)
+            );
 
             rc = (() @trusted => nxt_unit_response_add_field(
                 requestInfo_,
@@ -467,6 +632,26 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
     {
         return headers_;
     }
+
+    // Memory management methods
+
+    private void initialize(nxt_unit_request_info_t* requestInfo)
+    {
+        requestInfo_ = requestInfo;
+        // These are null at program startup
+        body_.initialize(this);
+        headers_.initialize(this);
+    }
+
+    private void reset()
+    {
+        body_.reset();
+        contentType_ = string.init;
+        hasStarted_ = false;
+        headers_.reset();
+        requestInfo_ = null;
+        statusCode_ = ushort.init;
+    }
 }
 
 @safe class HttpResponseHeaders
@@ -480,8 +665,8 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
 
     this(HttpResponse httpResponse)
     {
-        this.httpResponse = httpResponse;
         httpHeaders_ = HttpHeadersDictionary();
+        this.httpResponse = httpResponse;
     }
 
     void addField(string key, string value)
@@ -562,6 +747,21 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
     {
         length_ += key.length + value.length;
     }
+
+    // Memory management methods
+
+    private void initialize(HttpResponse httpResponse)
+    {
+        this.httpResponse = httpResponse;
+        httpHeaders_ = HttpHeadersDictionary();
+    }
+
+    private void reset()
+    {
+        httpHeaders_ = HttpHeadersDictionary.init;
+        httpResponse = null; // HttpResponseBody doesn't control HtttpResponse initialization
+        length_ = ulong.init;
+    }
 }
 
 alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
@@ -584,7 +784,10 @@ alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
         if (!httpResponse.hasStarted)
             (() @trusted => httpResponse.writeHeaders())();
         
-        enforce!InvalidOperationException(!hasFinalized, "Cannot write to the body of a complete response");
+        enforce!InvalidOperationException(
+            !hasFinalized,
+            "Cannot write to the body of a complete response"
+        );
 
         auto rc = sendResponse(httpResponse.requestInfo(), response);
         if (llvm_expect(rc != NXT_UNIT_OK, 0))
@@ -598,9 +801,26 @@ alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
 
         hasFinalized = true;
 
-        (() @trusted => nxt_unit_request_done(httpResponse.requestInfo(), unitReturnCode))();
+        (() @trusted => nxt_unit_request_done(
+            httpResponse.requestInfo(),
+            unitReturnCode
+        ))();
         if (unitReturnCode != NXT_UNIT_OK)
-            throw new UnitOperationException(message, unitReturnCode); // Halt further response processing now that we have cleaned up the response.
+            // Halt further response processing now that we have cleaned up the response.
+            throw new UnitOperationException(message, unitReturnCode);
+    }
+
+    // Memory management methods
+
+    private void initialize(HttpResponse httpResponse)
+    {
+        this.httpResponse = httpResponse;
+    }
+
+    private void reset()
+    {
+        hasFinalized = false;
+        httpResponse = null; // HttpResponseBody doesn't control HttpResponse initialization
     }
 }
 
@@ -610,13 +830,19 @@ package int sendResponse(nxt_unit_request_info_t* requestInfo, string response) 
     readInfo.read = &(writeResponseCallback);
     readInfo.eof = 0;
     readInfo.buf_size = 8192;
-    auto data = new ResponseData(response);
-    readInfo.data = cast(void*)data;
+    auto data = ResponseData(response);
+    // We're taking references to stack variables here.
+    // Usually that's a no-no, but we're sure those references won't live beyond this scope.
+    readInfo.data = (() @trusted => cast(void*)&data)();
     return (() @trusted => nxt_unit_response_write_cb(requestInfo, &readInfo))();
 }
 
 extern(C)
-package ptrdiff_t writeResponseCallback(nxt_unit_read_info_t* readInfo, void* destination, size_t size) @safe
+package ptrdiff_t writeResponseCallback(
+    nxt_unit_read_info_t* readInfo,
+    void* destination,
+    size_t size
+) @safe
 {
     auto data = (() @trusted => cast(ResponseData*)readInfo.data)();
 
@@ -661,7 +887,11 @@ package @safe struct ResponseData
         if (llvm_expect(maxBytes < bytesToCopy, 0))
             return -1; // Destination out of bounds access.
 
-        if (llvm_expect(sourceStart < &this.data[0] || &this.data[$ - 1] < &this.data[start + bytesToCopy - 1], 0))
+        auto accessingSourceOob = (
+            sourceStart < &this.data[0] ||
+            &this.data[$ - 1] < &this.data[start + bytesToCopy - 1]
+        );
+        if (llvm_expect(accessingSourceOob, 0))
             return -1; // Source out of bounds access.
 
         (() @trusted => memcpy(dst, cast(void*)(sourceStart), bytesToCopy))();
@@ -672,7 +902,8 @@ package @safe struct ResponseData
 
 @safe class InvalidOperationException : Exception
 {
-    this(string msg, string file = __FILE__, size_t line = __LINE__) {
+    this(string msg, string file = __FILE__, size_t line = __LINE__)
+    {
         super(msg, file, line);
     }
 }
@@ -681,7 +912,8 @@ package @safe struct ResponseData
 {
     int returnCode;
 
-    this(string msg, int returnCode, string file = __FILE__, size_t line = __LINE__) {
+    this(string msg, int returnCode, string file = __FILE__, size_t line = __LINE__)
+    {
         this.returnCode = returnCode;
         auto message = msg ~ " with return code " ~ to!string(returnCode);
         super(message, file, line);
