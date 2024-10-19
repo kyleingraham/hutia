@@ -91,7 +91,7 @@ package void unitRequestHandler(nxt_unit_request_info_t* requestInfo) @safe
         logUnit(
             requestInfo.ctx,
             UnitLogLevel.debug_,
-            format("unitRequestHandler - Response sent? %s", responseSent)
+            format("unitRequestHandler - Response sent? %s", cast(bool)responseSent)
         );
         auto message = (() @trusted => format("unitRequestHandler - %s", e))();
         logUnit(requestInfo.ctx, UnitLogLevel.error, message);
@@ -163,10 +163,6 @@ package enum UnitLogLevel : uint
 
     /**
        This free list requires implementation of 3 methods:
-           - a no-args constructor
-               - Should ensure that all heap-allocated object members are allocated but
-                 not initialized. Once called, the object can be made ready for a request
-                 by calling `initialize`.
            - an `initialize` method
                - Should make the object ready for a request.
                  Returns void and should accept all required arguments for initialization.
@@ -216,12 +212,6 @@ package enum UnitLogLevel : uint
         request_.reset();
         response_.reset();
     }
-
-    private this() // Call no-args constructor on any member requiring new
-    {
-        request_ = new HttpRequest();
-        response_ = new HttpResponse();
-    }
 }
 
 @safe class HttpRequest
@@ -249,7 +239,7 @@ package enum UnitLogLevel : uint
         body_ = new HttpRequestBodyStream(this.requestInfo);
     }
 
-    static RequestValues getRequestValues(
+    private static RequestValues getRequestValues(
         nxt_unit_request_info_t* requestInfo
     )
     {
@@ -329,16 +319,11 @@ package enum UnitLogLevel : uint
         method_ = string.init;
         nxt_unit_request_info_t* requestInfo = null;
     }
-
-    private this()
-    {
-        body_ = new HttpRequestBodyStream();
-    } // Call no-args constructor on any member requiring new
 }
 
-package string getString(nxt_unit_sptr_t* serializedPointer, size_t length) @system
+package string getString(nxt_unit_sptr_t* stringPointer, size_t length) @system
 {
-    auto start = nxt_unit_sptr_get(serializedPointer);
+    auto start = nxt_unit_sptr_get(stringPointer);
     return cast(string)(start[0..length]);
 }
 
@@ -439,6 +424,7 @@ package @safe class HttpRequestBodyStream : InputStream
     }
 
     // Deprecated InputStream interface members
+
     bool dataAvailableForRead()
     {
         return 0 < leastSize();
@@ -488,8 +474,6 @@ package @safe class HttpRequestBodyStream : InputStream
         isEmpty = false;
         position = ulong.init;
     }
-
-    private this(){} // Call no-args constructor on any member requiring new
 }
 
 package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
@@ -668,12 +652,6 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
         requestInfo_ = null;
         statusCode_ = ushort.init;
     }
-
-    private this() // Call no-args constructor on any member requiring new
-    {
-        body_ = new HttpResponseBody();
-        headers_ = new HttpResponseHeaders();
-    }
 }
 
 @safe class HttpResponseHeaders
@@ -784,8 +762,6 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
         httpResponse = null; // HttpResponseBody doesn't control HtttpResponse initialization
         length_ = ulong.init;
     }
-
-    private this(){} // Call no-args constructor on any member requiring new
 }
 
 alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
@@ -846,8 +822,6 @@ alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
         hasFinalized = false;
         httpResponse = null; // HttpResponseBody doesn't control HttpResponse initialization
     }
-
-    private this(){} // Call no-args constructor on any member requiring new
 }
 
 package int sendResponse(nxt_unit_request_info_t* requestInfo, string response) @safe
