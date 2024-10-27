@@ -10,6 +10,10 @@
 	"dependencies": {
 		"vibe-d:http": "~>0.10.1",
 		"eventcore": "~>0.9.34",
+		"lock-free": {
+			"repository": "git+https://github.com/MartinNowak/lock-free.git",
+			"version": "4d31e3866f2e6494a743df6c06dbe47f88fd0c53",
+		},
 	},
 	"dflags": [
 		"--preview=dip1000",

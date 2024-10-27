@@ -1,6 +1,9 @@
 import core.stdc.string : memcpy;
+import core.thread : Thread;
+import core.time : Duration, nsecs, msecs, MonoTime;
 import eventcore.driver : IOMode;
 import ldc.intrinsics : llvm_expect;
+import lock_free.rwqueue : RWQueue;
 import std.algorithm.comparison : min;
 import std.array : Appender;
 import std.concurrency : ownerTid, receive, receiveOnly, spawn,
@@ -12,8 +15,10 @@ import std.string : toStringz;
 import std.typecons : Nullable, Tuple;
 import unit_integration;
 import vibe.container.dictionarylist : DictionaryList;
-import vibe.core.concurrency : send;
-import vibe.core.core : exitEventLoop, runApplication, runTask;
+import vibe.container.ringbuffer : RingBuffer;
+import vibe.core.channel : createChannel, Channel, ChannelPriority, ChannelConfig;
+import vibe.core.concurrency : send, prioritySend;
+import vibe.core.core : exitEventLoop, runApplication, runTask, yield, createTimer;
 import vibe.core.task : Task;
 import vibe.core.stream : InputStream;
 
@@ -43,9 +48,26 @@ import vibe.core.stream : InputStream;
         auto webAppContext = WebApplicationContext();
         (() @trusted => spawn(&runUnit, webAppContext))();
 
-        dispatcherTask = runTask(&runDispatcher);
+        // Length of queue
+        import core.bitop : bsr;
+        auto v = 4096 / 8;
+        auto roundPow2 = v ? cast(size_t)1 << bsr(v) : 0;
+
+        logUnit(
+            null,
+            UnitLogLevel.debug_,
+            format("RequestInfoMessage.sizeof=%s roundPow2=%s", RequestInfoMessage.sizeof, roundPow2)
+        );
+        //
+
+        dispatcherTask = runTask(&runDispatcherNew2);
 
         runApplication();
+        logUnit(
+            null,
+            UnitLogLevel.debug_,
+            format("HttpContext.freeListLength=%s", HttpContext.freeListLength)
+        );
         return (() @trusted => receiveOnly!int)();
     }
 }
@@ -60,7 +82,19 @@ private void runDispatcher() @safe nothrow
     {
         void requestInfoHandler(RequestInfoMessage message)
         {
-            dispatch(message);
+            //auto poppedMessage = requestQueue.pop();
+            //dispatch(poppedMessage);
+            //auto spinDuration = 5.msecs;
+            //auto start = MonoTime.currTime;
+            //do
+            //{
+            //    while (!requestQueue.empty)
+            //    {
+            //        auto poppedMessage = requestQueue.pop();
+            //        dispatch(poppedMessage);
+            //    }
+            //    Thread.yield();
+            //} while (MonoTime.currTime - start < spinDuration);
         }
 
         void cancelHandler(CancelMessage message)
@@ -80,7 +114,96 @@ private void runDispatcher() @safe nothrow
         }
     }
 
-    exitEventLoop;
+    exitEventLoop();
+}
+
+Duration delegate() @safe exponentialBackoff() @safe
+{
+    // Start with an initial value of 0.
+    ulong current = 400_000_000;
+
+    return delegate() {
+        // Calculate the next backoff value in nanoseconds.
+        ulong nextBackoff = min(1_000_000_000, current * 100);
+        // Increment the current step to increase the backoff exponentially.
+        current++;
+
+        return nextBackoff.nsecs;
+    };
+}
+
+private void runDispatcherNew2() @safe nothrow
+{
+    try
+    {
+        RingBuffer!(RequestInfoMessage, 100, true) buffer;
+        RequestInfoMessage message;
+        logUnit(null, UnitLogLevel.debug_, "Starting runDispatcherNew2");
+
+        while (true)
+        {
+            requestChannel.consumeAll(buffer);
+            while (!buffer.empty)
+            {
+                message = buffer.front;
+                if (message.requestInfo is null)
+                {
+                    logUnit(null, UnitLogLevel.debug_, "Stopping runDispatcherNew2");
+                    break;
+                }
+                dispatch(message);
+                buffer.removeFront();
+            }
+        }
+    }
+    catch (Exception e)
+    {
+        auto message = (() @trusted => getExceptionMessage(e))();
+        logUnit(null, UnitLogLevel.alert, message);
+    }
+
+    exitEventLoop();
+}
+
+private void runDispatcherNew() @safe nothrow
+{
+    try
+    {
+        auto waiter = createTimer(null);
+        Duration delegate() @safe backoff;
+        logUnit(null, UnitLogLevel.debug_, "Starting runDispatcherNew");
+
+        while (cancelQueue.empty)
+        {
+            backoff = exponentialBackoff();
+            while (requestQueue.empty)
+            {
+                // High overhead. Max 20k req/sec.
+                //waiter.rearm(0.nsecs, false);
+                //waiter.wait();
+                // No overhead. Max 45k req/sec.
+                yield();
+            }
+
+            if (!cancelQueue.empty)
+            {
+                logUnit(null, UnitLogLevel.debug_, "Stopping runDispatcherNew");
+                break;
+            }
+
+            // should batch these out
+            auto message = requestQueue.pop();
+            //logUnit(null, UnitLogLevel.debug_, format("Popped=%s", message));
+            dispatch(message);
+        }
+    }
+    catch (Exception e)
+    {
+        auto message = (() @trusted => getExceptionMessage(e))();
+        logUnit(null, UnitLogLevel.alert, message);
+    }
+
+    exitEventLoop();
 }
 
 private struct RequestInfoMessage
@@ -90,17 +213,27 @@ private struct RequestInfoMessage
 
 private struct CancelMessage{}
 
+private shared(RWQueue!RequestInfoMessage) requestQueue;
+private shared(RWQueue!int) cancelQueue;
+
+nxt_unit_request_info_t* getRequestInfo(
+    shared(nxt_unit_request_info_t*) requestInfo
+) @trusted
+{
+    return cast(nxt_unit_request_info_t*)requestInfo;
+}
+
 private void dispatch(RequestInfoMessage message) @safe
 {
-    auto unitRequestInfo = (() @trusted {
-        /**
-         * We would normally keep this shared and access it through sychronized blocks.
-         * sychronized won't do much for us here though because Unit retains control
-         * of the pointer. We are trusting in Unit's management of it while we have it.
-         * We are also retaining a single-threaded model for Hutia.
-         * */
-        return cast(nxt_unit_request_info_t*)message.requestInfo;
-    })();
+    //auto unitRequestInfo = (() @trusted {
+    //    /**
+    //     * We would normally keep this shared and access it through sychronized blocks.
+    //     * sychronized won't do much for us here though because Unit retains control
+    //     * of the pointer. We are trusting in Unit's management of it while we have it.
+    //     * We are also retaining a single-threaded model for Hutia.
+    //     * */
+    //    return cast(nxt_unit_request_info_t*)message.requestInfo;
+    //})();
 
     runTask((nxt_unit_request_info_t* requestInfo) nothrow {
         try
@@ -127,7 +260,7 @@ private void dispatch(RequestInfoMessage message) @safe
             auto message = (() @trusted => getExceptionMessage(e))();
             logUnit(requestInfo.ctx, UnitLogLevel.alert, message);
         }
-    }, unitRequestInfo);
+    }, getRequestInfo(message.requestInfo));
 }
 
 private string getExceptionMessage(Throwable e) @system nothrow
@@ -183,8 +316,23 @@ private void runUnit(const(WebApplicationContext) webAppContext) @system
     nxt_unit_done(unitContext);
 
     fail:
-    send(dispatcherTask, CancelMessage());
+    //send(dispatcherTask, CancelMessage());
+
+    //cancelQueue.push(1);
+    //requestQueue.push(shared RequestInfoMessage(null));
+
+    requestChannel.put(RequestInfoMessage(null));
     send(ownerTid, rc);
+}
+
+shared Channel!RequestInfoMessage requestChannel;
+
+shared static this()
+{
+    // to use ChannelPriority.overhead one must close channel
+    requestChannel = createChannel!RequestInfoMessage(
+        ChannelConfig(ChannelPriority.overhead)
+    );
 }
 
 extern(C)
@@ -192,7 +340,17 @@ private void unitRequestHandler(nxt_unit_request_info_t* requestInfo) @system
 {
     // We are trusting that Unit manages this pointer safely after passing it to us.
     auto sharedRequestInfo = cast(shared)requestInfo;
-    send(dispatcherTask, RequestInfoMessage(sharedRequestInfo));
+    auto message = RequestInfoMessage(sharedRequestInfo);
+
+    //while (requestQueue.full)
+        //Thread.yield();
+    //requestQueue.push(cast(shared(RequestInfoMessage))message);
+    //logUnit(null, UnitLogLevel.debug_, format("Pushed=%s", message));
+    //prioritySend(dispatcherTask, RequestInfoMessage(null)); // Let dispatcher no requests available
+
+    requestChannel.put(message);
+
+    //send(dispatcherTask, message);
 }
 
 extern(C)
@@ -299,6 +457,19 @@ enum UnitLogLevel : uint
     }
 
     private HttpContext next;
+
+    private static size_t freeListLength()
+    {
+        HttpContext element = freeList;
+        size_t count;
+        while (element !is HttpContext.init)
+        {
+            element = element.next;
+            count += 1;
+        }
+
+        return count;
+    }
 
     // Memory management methods
 

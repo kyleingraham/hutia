@@ -1,8 +1,10 @@
+import core.time : Duration, msecs;
 import hutia : HttpContext, logError, WebApplication;
 import std.array : Appender;
 import std.format : format;
 import std.random : uniform;
 import std.utf : UTFException;
+import vibe.core.core : sleep;
 import vibe.stream.operations : readAllUTF8;
 
 int main(string[] args) @safe
@@ -52,6 +54,8 @@ string handler(HttpContext httpContext) @safe
 </html>
 `);
 
+    //sleep(randomDuration);
+
     return response.data;
 }
 
@@ -64,4 +68,9 @@ string randomString(uint length = 12) @safe
         result.put(charset[uniform(0, charset.length)]);
 
     return result.data;
+}
+
+Duration randomDuration(int min = 50, int max = 150) @safe
+{
+    return uniform(min, max).msecs;
 }
