@@ -8,24 +8,35 @@
 	"name": "hutia",
 	"targetType": "library",
 	"dependencies": {
-		"vibe-d:http": "~>0.10.1",
 		"eventcore": "~>0.9.34",
-		"lock-free": {
-			"repository": "git+https://github.com/MartinNowak/lock-free.git",
-			"version": "4d31e3866f2e6494a743df6c06dbe47f88fd0c53",
-		},
+		"vibe-d:http": "~>0.10.1",
 	},
 	"dflags": [
 		"--preview=dip1000",
 	],
-	"lflags-linux": [
-		"-lunit",
-	],
-	"lflags-osx": [
-		"-L/opt/homebrew/lib",
-		"-lunit",
-	],
-	"buildEnvironments-osx": {
-		"C_INCLUDE_PATH": "/opt/homebrew/include",
-	},
+    "configurations": {
+        "apple": {
+            "platforms": [
+                "osx",
+            ],
+            "subConfigurations": {
+                "eventcore": "kqueue",
+            },
+            "buildEnvironments": {
+                "C_INCLUDE_PATH": "/opt/homebrew/include",
+            },
+            "lflags": [
+                "-L/opt/homebrew/lib",
+                "-lunit",
+            ],
+        },
+        "linux": {
+            "platforms": [
+                "linux",
+            ],
+            "lflags": [
+                "-lunit",
+            ],
+        },
+    },
 }
