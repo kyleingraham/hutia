@@ -8,13 +8,14 @@ import vibe.stream.operations : readAllUTF8;
 int main(string[] args) @safe
 {
     auto app = WebApplication.create();
+    // map doesn't do any routing today and only supports setting a single handler app-wide.
     return app
-           .map("", &handler) // map doesn't do any routing today and only supports setting a single handler app-wide.
+           .map("", &handler)
            .run();
 }
 
-// We need extern(C) here to satisfy an implementation detail of hutia's NGINX Unit integration.
-// In a future version this requirement won't be imposed on users.
+// We need extern(C) here to satisfy an implementation detail of hutia's NGINX Unit
+// integration. In a future version this requirement won't be imposed on users.
 extern(C)
 string handler(HttpContext httpContext) @safe
 {
@@ -25,7 +26,8 @@ string handler(HttpContext httpContext) @safe
         auto requestBody = httpRequest.body.readAllUTF8();
     } catch (UTFException e) {
         auto message = (() @trusted => format("handler - %s", e))();
-        logError(httpContext, message); // D's standard library logger locks Unit. Looks to cause busy-waiting.
+        // D's standard library logger locks Unit. Looks to cause busy-waiting.
+        logError(httpContext, message);
     }
 
     auto httpResponse = httpContext.response;
@@ -52,6 +54,13 @@ string handler(HttpContext httpContext) @safe
 </html>
 `);
 
+    debug(Concurrency)
+    {
+        import vibe.core.core : sleep;
+
+        sleep(randomDuration);
+    }
+
     return response.data;
 }
 
@@ -64,4 +73,14 @@ string randomString(uint length = 12) @safe
         result.put(charset[uniform(0, charset.length)]);
 
     return result.data;
+}
+
+debug(Concurrency)
+{
+    import core.time : Duration, msecs;
+
+    Duration randomDuration(int min = 50, int max = 150) @safe
+    {
+        return uniform(min, max).msecs;
+    }
 }

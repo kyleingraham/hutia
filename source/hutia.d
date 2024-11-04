@@ -1,9 +1,8 @@
 import core.stdc.string : memcpy;
 import eventcore.driver : IOMode;
-import ldc.intrinsics : llvm_expect;
 import std.algorithm.comparison : min;
 import std.array : Appender;
-import std.concurrency : thisTid;
+import std.concurrency : ownerTid, receive, receiveOnly, spawn;
 import std.conv : to;
 import std.exception : enforce;
 import std.format : format;
@@ -11,16 +10,13 @@ import std.string : toStringz;
 import std.typecons : Nullable, Tuple;
 import unit_integration;
 import vibe.container.dictionarylist : DictionaryList;
+import vibe.core.concurrency : send;
+import vibe.core.core : exitEventLoop, runApplication, runTask;
+import vibe.core.task : Task;
 import vibe.core.stream : InputStream;
 
 @safe class WebApplication
 {
-    private
-    {
-        RequestFunction handler_;
-        WebApplicationContext* webAppContext;
-    }
-
     this(){}
 
     static WebApplication create()
@@ -30,87 +26,194 @@ import vibe.core.stream : InputStream;
 
     WebApplication map(string route, RequestFunction handler)
     {
-        handler_ = handler;
+        setHandler(handler);
         return this;
     }
 
     int run()
     {
-        webAppContext = new WebApplicationContext(handler_);
-        return (() @trusted => runUnit(webAppContext))();
+        auto webAppContext = WebApplicationContext();
+        (() @trusted => spawn(&runUnit, webAppContext))();
+
+        dispatcherTask = runTask(&runDispatcher);
+
+        runApplication();
+        logUnit(
+            null,
+            UnitLogLevel.debug_,
+            format("HttpContext.freeListLength=%s", HttpContext.freeListLength)
+        );
+        return (() @trusted => receiveOnly!int)();
     }
 }
 
-alias RequestFunction = extern(C) string function(HttpContext) @safe;
+private shared Task dispatcherTask;
 
-extern(C)
-@safe struct WebApplicationContext
+private void runDispatcher() @safe nothrow
 {
-    RequestFunction handler;
+    bool shouldRun = true;
+
+    while (shouldRun)
+    {
+        void requestInfoHandler(RequestInfoMessage message)
+        {
+            dispatch(message);
+        }
+
+        void cancelHandler(CancelMessage message)
+        {
+            shouldRun = false;
+        }
+
+        try
+        {
+            (() @trusted => receive(&requestInfoHandler, &cancelHandler))();
+        }
+        catch (Exception e)
+        {
+            auto message = (() @trusted => getExceptionMessage(e))();
+            logUnit(null, UnitLogLevel.alert, message);
+            shouldRun = false;
+        }
+    }
+
+    exitEventLoop();
 }
 
-package int runUnit(WebApplicationContext* webAppContext) @system
+private struct RequestInfoMessage
 {
+    shared nxt_unit_request_info_t* requestInfo;
+}
+
+private struct CancelMessage{}
+
+nxt_unit_request_info_t* getRequestInfo(
+    shared(nxt_unit_request_info_t*) requestInfo
+) @trusted
+{
+    /**
+     * We would normally keep this shared and access it through sychronized blocks.
+     * sychronized won't do much for us here though because Unit retains control
+     * of the pointer. We are trusting in Unit's management of it while we have it.
+     * We are also retaining a single-threaded model for Hutia.
+     * */
+    return cast(nxt_unit_request_info_t*)requestInfo;
+}
+
+private void dispatch(RequestInfoMessage message) @safe
+{
+    runTask((nxt_unit_request_info_t* requestInfo) nothrow {
+        try
+        {
+            auto httpContext = HttpContext.allocate(requestInfo);
+            scope (exit)
+            {
+                httpContext.response.complete();
+                HttpContext.deallocate(httpContext);
+            }
+
+            httpContext.response.body.write(
+                getHandler()(httpContext)
+            );
+        }
+        catch (Exception e)
+        {
+            /**
+             * Any uncaught exception while writing the repsonse should result in the
+             * request being finalized gracefully. Ideally there is another layer above
+             * this ensuring the status code is updated to a 500. Uncaught exceptions
+             * will break Unit.
+             * */
+            auto message = (() @trusted => getExceptionMessage(e))();
+            logUnit(requestInfo.ctx, UnitLogLevel.alert, message);
+        }
+    }, getRequestInfo(message.requestInfo));
+}
+
+private string getExceptionMessage(Throwable e) @system nothrow
+{
+    import std.format : FormatException;
+
+    try
+        return format("%s", e);
+    catch (FormatException)
+        return e.msg;
+    catch (Exception)
+        return e.msg;
+}
+
+private alias RequestFunction = extern(C) string function(HttpContext) @safe;
+
+private shared Nullable!RequestFunction handler;
+
+private void setHandler(RequestFunction newHandler) @safe
+{
+    synchronized
+    {
+        if ((cast(Nullable!RequestFunction)handler).isNull)
+            handler = Nullable!RequestFunction(newHandler);
+        else
+            throw new InvalidOperationException("Cannot set handler more than once");
+    }
+}
+
+private const(RequestFunction) getHandler() @safe
+{
+    return (cast(Nullable!RequestFunction)handler).get;
+}
+
+extern(C)
+private @safe struct WebApplicationContext{}
+
+private void runUnit(const(WebApplicationContext) webAppContext) @system
+{
+    int rc;
     nxt_unit_init_t init;
     init.callbacks.request_handler = &(unitRequestHandler);
     init.callbacks.ready_handler   = &(unitReadyHandler);
 
     nxt_unit_ctx_t* unitContext = nxt_unit_init(&init);
     if (unitContext is null)
-        return NXT_UNIT_ERROR;
+    {
+        rc = NXT_UNIT_ERROR;
+        goto fail;
+    }
 
-    unitContext.data = cast(void*)webAppContext;
-
-     auto rc = nxt_unit_run(unitContext);
+    rc = nxt_unit_run(unitContext);
     nxt_unit_done(unitContext);
-    return rc;
+
+    fail:
+    send(dispatcherTask, CancelMessage());
+    send(ownerTid, rc);
 }
 
 extern(C)
-package void unitRequestHandler(nxt_unit_request_info_t* requestInfo) @safe
+private void unitRequestHandler(nxt_unit_request_info_t* requestInfo) @system
 {
-    auto httpContext = HttpContext.allocate(requestInfo);
-    scope (exit)
-    {
-        httpContext.response.complete();
-        HttpContext.deallocate(httpContext);
-    }
-    auto webAppContext = (() @trusted => cast(WebApplicationContext*)requestInfo.ctx.data)();
-    try
-    {
-        httpContext.response.body.write(
-            webAppContext.handler(httpContext) // TODO: shared handler?
-        );
-    }
-    catch (Exception e)
-    {
-        // Any uncaught exception while writing the repsonse should result in the request 
-        // being finalized gracefully. Ideally there is another layer above this ensuring 
-        // the status code is updated to a 500. Uncaught exceptions will break Unit.
-        auto responseSent = (() @trusted => nxt_unit_response_is_sent(requestInfo))();
-        logUnit(
-            requestInfo.ctx,
-            UnitLogLevel.debug_,
-            format("unitRequestHandler - Response sent? %s", cast(bool)responseSent)
-        );
-        auto message = (() @trusted => format("unitRequestHandler - %s", e))();
-        logUnit(requestInfo.ctx, UnitLogLevel.error, message);
-    }
+    // We are trusting that Unit manages this pointer safely after passing it to us.
+    auto sharedRequestInfo = cast(shared)requestInfo;
+    auto message = RequestInfoMessage(sharedRequestInfo);
+
+    send(dispatcherTask, message);
 }
 
 extern(C)
-package int unitReadyHandler(nxt_unit_ctx_t* unitContext) @safe
+private int unitReadyHandler(nxt_unit_ctx_t* unitContext) @safe
 {
     return NXT_UNIT_OK;
 }
 
-package void logUnit(
+void logUnit(
     nxt_unit_ctx_t* unitContext,
     UnitLogLevel logLevel,
     string message
-) @trusted
+) @trusted nothrow
 {
-    nxt_unit_log(unitContext, logLevel, ("[D] " ~ message).toStringz);
+    try
+        nxt_unit_log(
+            cast(nxt_unit_ctx_t*)unitContext, logLevel, ("[Hutia] " ~ message).toStringz
+        );
+    catch(Exception e){};
 }
 
 void logError(HttpContext httpContext, string message) @trusted
@@ -118,7 +221,7 @@ void logError(HttpContext httpContext, string message) @trusted
     logUnit(httpContext.request.requestInfo.ctx, UnitLogLevel.error, message);
 }
 
-package enum UnitLogLevel : uint 
+enum UnitLogLevel : uint
 {
     alert = NXT_UNIT_LOG_ALERT,
     error = NXT_UNIT_LOG_ERR,
@@ -142,7 +245,7 @@ package enum UnitLogLevel : uint
         response_ = response;
     }
 
-    static HttpContext create(nxt_unit_request_info_t* requestInfo)
+    private static HttpContext create(nxt_unit_request_info_t* requestInfo)
     {
         auto request = HttpRequest.create(requestInfo);
         auto response = HttpResponse.create(requestInfo);
@@ -162,19 +265,19 @@ package enum UnitLogLevel : uint
     // Free List
 
     /**
-       This free list requires implementation of 3 methods:
-           - an `initialize` method
-               - Should make the object ready for a request.
-                 Returns void and should accept all required arguments for initialization.
-           - a `reset` method
-               - Resets an object to an uninitialized, but allocated state. The object
-                 should have no remnants of the last request it participated in.
-                 Returns void and accepts no arguments.
-       */
+     * This free list requires implementation of 3 methods:
+     *     - an `initialize` method
+     *         - Should make the object ready for a request.
+     *           Returns void and should accept all required arguments for initialization.
+     *     - a `reset` method
+     *         - Resets an object to an uninitialized, but allocated state. The object
+     *           should have no remnants of the last request it participated in.
+     *           Returns void and accepts no arguments.
+     * */
 
-    static HttpContext freeList;
+    private static HttpContext freeList;
 
-    static HttpContext allocate(nxt_unit_request_info_t* requestInfo)
+    private static HttpContext allocate(nxt_unit_request_info_t* requestInfo)
     {
         HttpContext httpContext;
 
@@ -190,14 +293,27 @@ package enum UnitLogLevel : uint
         return httpContext;
     }
 
-    static void deallocate(HttpContext httpContext)
+    private static void deallocate(HttpContext httpContext)
     {
         httpContext.reset();
         httpContext.next = freeList;
         freeList = httpContext;
     }
 
-    HttpContext next;
+    private HttpContext next;
+
+    private static size_t freeListLength()
+    {
+        HttpContext element = freeList;
+        size_t count;
+        while (element !is HttpContext.init)
+        {
+            element = element.next;
+            count += 1;
+        }
+
+        return count;
+    }
 
     // Memory management methods
 
@@ -257,7 +373,7 @@ package enum UnitLogLevel : uint
         );
     }
 
-    static HttpRequest create(nxt_unit_request_info_t* requestInfo)
+    private static HttpRequest create(nxt_unit_request_info_t* requestInfo)
     {
         auto requestValues = getRequestValues(requestInfo);
         auto httpRequest =  new HttpRequest(
@@ -321,13 +437,13 @@ package enum UnitLogLevel : uint
     }
 }
 
-package string getString(nxt_unit_sptr_t* stringPointer, size_t length) @system
+private string getString(nxt_unit_sptr_t* stringPointer, size_t length) @system
 {
     auto start = nxt_unit_sptr_get(stringPointer);
     return cast(string)(start[0..length]);
 }
 
-package HttpHeadersDictionary getHeaders(nxt_unit_request_t* unitRequest) @safe
+private HttpHeadersDictionary getHeaders(nxt_unit_request_t* unitRequest) @safe
 {
     auto headers = HttpHeadersDictionary();
 
@@ -343,7 +459,7 @@ package HttpHeadersDictionary getHeaders(nxt_unit_request_t* unitRequest) @safe
     return headers;
 }
 
-package nxt_unit_field_t* getField(
+private nxt_unit_field_t* getField(
     nxt_unit_request_t* unitRequest,
     size_t fieldOffset
 ) @system
@@ -351,9 +467,11 @@ package nxt_unit_field_t* getField(
     return cast(nxt_unit_field_t*)unitRequest.fields + fieldOffset;
 }
 
-alias RequestValues = Tuple!(string, "path", string, "method", HttpHeadersDictionary, "headers");
+alias RequestValues = Tuple!(
+    string, "path", string, "method", HttpHeadersDictionary, "headers"
+);
 
-package @safe class HttpRequestBodyStream : InputStream
+private @safe class HttpRequestBodyStream : InputStream
 {
     private 
     {
@@ -441,8 +559,10 @@ package @safe class HttpRequestBodyStream : InputStream
         // If content length is known, return the remaining size
         if (!contentLength.isNull)
         {
-            auto remainingContentLength = contentLength.get > position ? contentLength.get - position : 0;
-            return remainingContentLength;
+            if (contentLength.get > position)
+                return contentLength.get - position;
+            else
+                return 0;
         }
 
         // For cases with no content length, check Unit's buffers directly
@@ -476,7 +596,7 @@ package @safe class HttpRequestBodyStream : InputStream
     }
 }
 
-package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
+private Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
 {
     Nullable!ulong contentLength;
 
@@ -509,14 +629,14 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
         ushort statusCode_;
     }
 
-    this(nxt_unit_request_info_t* requestInfo)
+    private this(nxt_unit_request_info_t* requestInfo)
     {
         requestInfo_ = requestInfo;
         body_ = new HttpResponseBody(this);
         headers_ = new HttpResponseHeaders(this);
     }
 
-    static HttpResponse create(nxt_unit_request_info_t* requestInfo)
+    private static HttpResponse create(nxt_unit_request_info_t* requestInfo)
     {
         return new HttpResponse(requestInfo);
     }
@@ -583,7 +703,7 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
             cast(uint)headers_.count,
             cast(uint)headers_.length
         );
-        if (llvm_expect(rc != NXT_UNIT_OK, 0))
+        if (rc != NXT_UNIT_OK)
             body.finalize(rc, "Response initialization failed");
 
         foreach(key, value; headers_.byKeyValue)
@@ -604,12 +724,12 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
                 value.toStringz,
                 cast(uint)value.length
             ))();
-            if (llvm_expect(rc != NXT_UNIT_OK, 0))
+            if (rc != NXT_UNIT_OK)
                 body.finalize(rc, "Adding header to response failed");
         }
 
         rc = nxt_unit_response_send(requestInfo);
-        if (llvm_expect(rc != NXT_UNIT_OK, 0))
+        if (rc != NXT_UNIT_OK)
             body.finalize(rc, "Sending header response failed");
     }
 
@@ -654,7 +774,7 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
     }
 }
 
-@safe class HttpResponseHeaders
+private @safe class HttpResponseHeaders
 {
     private
     {
@@ -663,7 +783,7 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
         ulong length_;
     }
 
-    this(HttpResponse httpResponse)
+    private this(HttpResponse httpResponse)
     {
         httpHeaders_ = HttpHeadersDictionary();
         this.httpResponse = httpResponse;
@@ -691,7 +811,7 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
         return httpHeaders_.byKeyValue();
     }
 
-    size_t count()
+    private size_t count()
     {
         return httpHeaders_.length;
     }
@@ -706,7 +826,7 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
         httpHeaders_.getAll(key, del);
     }
 
-    ulong length()
+    private ulong length()
     {
         return length_;
     }
@@ -759,12 +879,13 @@ package Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
     private void reset()
     {
         httpHeaders_ = HttpHeadersDictionary.init;
-        httpResponse = null; // HttpResponseBody doesn't control HtttpResponse initialization
+        // HttpResponseBody doesn't control HtttpResponse initialization.
+        httpResponse = null;
         length_ = ulong.init;
     }
 }
 
-alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
+private alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
 
 @safe class HttpResponseBody
 {
@@ -774,7 +895,7 @@ alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
         HttpResponse httpResponse;
     }
 
-    this(HttpResponse httpResponse)
+    private this(HttpResponse httpResponse)
     {
         this.httpResponse = httpResponse;
     }
@@ -790,7 +911,7 @@ alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
         );
 
         auto rc = sendResponse(httpResponse.requestInfo(), response);
-        if (llvm_expect(rc != NXT_UNIT_OK, 0))
+        if (rc != NXT_UNIT_OK)
             finalize(rc, "Writing response body failed");
     }
 
@@ -820,11 +941,12 @@ alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
     private void reset()
     {
         hasFinalized = false;
-        httpResponse = null; // HttpResponseBody doesn't control HttpResponse initialization
+        // HttpResponseBody doesn't control HttpResponse initialization.
+        httpResponse = null;
     }
 }
 
-package int sendResponse(nxt_unit_request_info_t* requestInfo, string response) @safe
+private int sendResponse(nxt_unit_request_info_t* requestInfo, string response) @safe
 {
     nxt_unit_read_info_t readInfo = nxt_unit_read_info_t.init;
     readInfo.read = &(writeResponseCallback);
@@ -838,7 +960,7 @@ package int sendResponse(nxt_unit_request_info_t* requestInfo, string response) 
 }
 
 extern(C)
-package ptrdiff_t writeResponseCallback(
+private ptrdiff_t writeResponseCallback(
     nxt_unit_read_info_t* readInfo,
     void* destination,
     size_t size
@@ -859,7 +981,7 @@ package ptrdiff_t writeResponseCallback(
 }
 
 extern(C)
-package @safe struct ResponseData
+private @safe struct ResponseData
 {
     private
     {
@@ -884,14 +1006,14 @@ package @safe struct ResponseData
         auto sourceStart = &this.data[start];
 
         // NGINX Unit interprets a negative return as an error.
-        if (llvm_expect(maxBytes < bytesToCopy, 0))
+        if (maxBytes < bytesToCopy)
             return -1; // Destination out of bounds access.
 
         auto accessingSourceOob = (
             sourceStart < &this.data[0] ||
             &this.data[$ - 1] < &this.data[start + bytesToCopy - 1]
         );
-        if (llvm_expect(accessingSourceOob, 0))
+        if (accessingSourceOob)
             return -1; // Source out of bounds access.
 
         (() @trusted => memcpy(dst, cast(void*)(sourceStart), bytesToCopy))();
