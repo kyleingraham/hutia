@@ -56,7 +56,13 @@ string handler(HttpContext httpContext) @safe
 
     debug(Concurrency)
     {
+        import core.time : Duration, msecs;
         import vibe.core.core : sleep;
+
+        Duration randomDuration(int min = 50, int max = 150) @safe
+        {
+            return uniform(min, max).msecs;
+        }
 
         sleep(randomDuration);
     }
@@ -73,14 +79,4 @@ string randomString(uint length = 12) @safe
         result.put(charset[uniform(0, charset.length)]);
 
     return result.data;
-}
-
-debug(Concurrency)
-{
-    import core.time : Duration, msecs;
-
-    Duration randomDuration(int min = 50, int max = 150) @safe
-    {
-        return uniform(min, max).msecs;
-    }
 }
