@@ -38,11 +38,7 @@ import vibe.core.stream : InputStream;
         dispatcherTask = runTask(&runDispatcher);
 
         runApplication();
-        logUnit(
-            null,
-            UnitLogLevel.debug_,
-            format("HttpContext.freeListLength=%s", HttpContext.freeListLength)
-        );
+
         return (() @trusted => receiveOnly!int)();
     }
 }
@@ -105,11 +101,10 @@ private void dispatch(RequestInfoMessage message) @safe
     runTask((nxt_unit_request_info_t* requestInfo) nothrow {
         try
         {
-            auto httpContext = HttpContext.allocate(requestInfo);
+            auto httpContext = new HttpContext(requestInfo);
             scope (exit)
             {
                 httpContext.response.complete();
-                HttpContext.deallocate(httpContext);
             }
 
             httpContext.response.body.write(
@@ -239,17 +234,10 @@ enum UnitLogLevel : uint
         HttpResponse response_;
     }
 
-    private this(HttpRequest request, HttpResponse response)
+    this(nxt_unit_request_info_t* requestInfo)
     {
-        request_ = request;
-        response_ = response;
-    }
-
-    private static HttpContext create(nxt_unit_request_info_t* requestInfo)
-    {
-        auto request = HttpRequest.create(requestInfo);
-        auto response = HttpResponse.create(requestInfo);
-        return new HttpContext(request, response);
+        request_ = new HttpRequest(requestInfo);
+        response_ = new HttpResponse(requestInfo);
     }
 
     HttpRequest request()
@@ -260,73 +248,6 @@ enum UnitLogLevel : uint
     HttpResponse response()
     {
         return response_;
-    }
-
-    // Free List
-
-    /**
-     * This free list requires implementation of 3 methods:
-     *     - an `initialize` method
-     *         - Should make the object ready for a request.
-     *           Returns void and should accept all required arguments for initialization.
-     *     - a `reset` method
-     *         - Resets an object to an uninitialized, but allocated state. The object
-     *           should have no remnants of the last request it participated in.
-     *           Returns void and accepts no arguments.
-     * */
-
-    private static HttpContext freeList;
-
-    private static HttpContext allocate(nxt_unit_request_info_t* requestInfo)
-    {
-        HttpContext httpContext;
-
-        if (freeList)
-        {
-            httpContext = freeList;
-            freeList = httpContext.next;
-            httpContext.initialize(requestInfo);
-        }
-        else
-            httpContext = HttpContext.create(requestInfo);
-
-        return httpContext;
-    }
-
-    private static void deallocate(HttpContext httpContext)
-    {
-        httpContext.reset();
-        httpContext.next = freeList;
-        freeList = httpContext;
-    }
-
-    private HttpContext next;
-
-    private static size_t freeListLength()
-    {
-        HttpContext element = freeList;
-        size_t count;
-        while (element !is HttpContext.init)
-        {
-            element = element.next;
-            count += 1;
-        }
-
-        return count;
-    }
-
-    // Memory management methods
-
-    private void initialize(nxt_unit_request_info_t* requestInfo)
-    {
-        request_.initialize(requestInfo);
-        response_.initialize(requestInfo);
-    }
-
-    private void reset()
-    {
-        request_.reset();
-        response_.reset();
     }
 }
 
@@ -341,17 +262,13 @@ enum UnitLogLevel : uint
         nxt_unit_request_info_t* requestInfo;
     }
 
-    private this(
-        nxt_unit_request_info_t* requestInfo,
-        string path,
-        string method,
-        HttpHeadersDictionary headers
-    )
+    this(nxt_unit_request_info_t* requestInfo)
     {
         this.requestInfo = requestInfo;
-        path_ = path;
-        method_ = method;
-        headers_ = headers;
+        auto requestValues = getRequestValues(this.requestInfo);
+        path_ = requestValues.path;
+        method_ = requestValues.method;
+        headers_ = requestValues.headers;
         body_ = new HttpRequestBodyStream(this.requestInfo);
     }
 
@@ -371,19 +288,6 @@ enum UnitLogLevel : uint
         return RequestValues(
             path, method, headers
         );
-    }
-
-    private static HttpRequest create(nxt_unit_request_info_t* requestInfo)
-    {
-        auto requestValues = getRequestValues(requestInfo);
-        auto httpRequest =  new HttpRequest(
-            requestInfo,
-            requestValues.path,
-            requestValues.method,
-            requestValues.headers
-        );
-
-        return httpRequest;
     }
 
     InputStream body()
@@ -413,27 +317,6 @@ enum UnitLogLevel : uint
     override string toString()
     {
         return "HttpRequest(\"" ~ method ~ "\", \"" ~ path ~ "\")";
-    }
-
-    // Memory management methods
-
-    private void initialize(nxt_unit_request_info_t* requestInfo)
-    {
-        (cast(HttpRequestBodyStream)body_).initialize(requestInfo);
-        auto requestValues = getRequestValues(requestInfo);
-        path_ = requestValues.path;
-        method_ = requestValues.method;
-        headers_ = requestValues.headers;
-        this.requestInfo = requestInfo;
-    }
-
-    private void reset()
-    {
-        (cast(HttpRequestBodyStream)body_).reset();
-        headers_ = HttpHeadersDictionary.init;
-        path_ = string.init;
-        method_ = string.init;
-        nxt_unit_request_info_t* requestInfo = null;
     }
 }
 
@@ -578,22 +461,6 @@ private @safe class HttpRequestBodyStream : InputStream
         // Otherwise, we return remainingBuffer bytes for further reading
         return remainingBuffer;
     }
-
-    // Memory management methods
-
-    private void initialize(nxt_unit_request_info_t* requestInfo)
-    {
-        this.requestInfo = requestInfo;
-        this.contentLength = (() @trusted => getContentLength(requestInfo.request))();
-    }
-
-    private void reset()
-    {
-        requestInfo = null;
-        Nullable!ulong contentLength = Nullable!ulong();
-        isEmpty = false;
-        position = ulong.init;
-    }
 }
 
 private Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
@@ -629,16 +496,11 @@ private Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
         ushort statusCode_;
     }
 
-    private this(nxt_unit_request_info_t* requestInfo)
+    this(nxt_unit_request_info_t* requestInfo)
     {
-        requestInfo_ = requestInfo;
         body_ = new HttpResponseBody(this);
         headers_ = new HttpResponseHeaders(this);
-    }
-
-    private static HttpResponse create(nxt_unit_request_info_t* requestInfo)
-    {
-        return new HttpResponse(requestInfo);
+        requestInfo_ = requestInfo;
     }
 
     HttpResponseBody body()
@@ -752,26 +614,6 @@ private Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
     {
         return headers_;
     }
-
-    // Memory management methods
-
-    private void initialize(nxt_unit_request_info_t* requestInfo)
-    {
-        requestInfo_ = requestInfo;
-        // These are null at program startup
-        body_.initialize(this);
-        headers_.initialize(this);
-    }
-
-    private void reset()
-    {
-        body_.reset();
-        contentType_ = string.init;
-        hasStarted_ = false;
-        headers_.reset();
-        requestInfo_ = null;
-        statusCode_ = ushort.init;
-    }
 }
 
 private @safe class HttpResponseHeaders
@@ -783,7 +625,7 @@ private @safe class HttpResponseHeaders
         ulong length_;
     }
 
-    private this(HttpResponse httpResponse)
+    this(HttpResponse httpResponse)
     {
         httpHeaders_ = HttpHeadersDictionary();
         this.httpResponse = httpResponse;
@@ -867,22 +709,6 @@ private @safe class HttpResponseHeaders
     {
         length_ += key.length + value.length;
     }
-
-    // Memory management methods
-
-    private void initialize(HttpResponse httpResponse)
-    {
-        this.httpResponse = httpResponse;
-        httpHeaders_ = HttpHeadersDictionary();
-    }
-
-    private void reset()
-    {
-        httpHeaders_ = HttpHeadersDictionary.init;
-        // HttpResponseBody doesn't control HtttpResponse initialization.
-        httpResponse = null;
-        length_ = ulong.init;
-    }
 }
 
 private alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
@@ -895,7 +721,7 @@ private alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
         HttpResponse httpResponse;
     }
 
-    private this(HttpResponse httpResponse)
+    this(HttpResponse httpResponse)
     {
         this.httpResponse = httpResponse;
     }
@@ -929,20 +755,6 @@ private alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
         if (unitReturnCode != NXT_UNIT_OK)
             // Halt further response processing now that we have cleaned up the response.
             throw new UnitOperationException(message, unitReturnCode);
-    }
-
-    // Memory management methods
-
-    private void initialize(HttpResponse httpResponse)
-    {
-        this.httpResponse = httpResponse;
-    }
-
-    private void reset()
-    {
-        hasFinalized = false;
-        // HttpResponseBody doesn't control HttpResponse initialization.
-        httpResponse = null;
     }
 }
 
