@@ -12,7 +12,6 @@ import unit_integration;
 import vibe.container.dictionarylist : DictionaryList;
 import vibe.core.concurrency : send;
 import vibe.core.core : exitEventLoop, runApplication, runTask;
-import vibe.internal.freelistref : FreeListRef;
 import vibe.core.task : Task;
 import vibe.core.stream : InputStream;
 
@@ -102,7 +101,7 @@ private void dispatch(RequestInfoMessage message) @safe
     runTask((nxt_unit_request_info_t* requestInfo) nothrow {
         try
         {
-            auto httpContext = FreeListRef!HttpContext(requestInfo);
+            auto httpContext = new HttpContext(requestInfo);
             scope (exit)
             {
                 httpContext.response.complete();
@@ -231,21 +230,14 @@ enum UnitLogLevel : uint
 {
     private
     {
-        FreeListRef!HttpRequest request_;
-        FreeListRef!HttpResponse response_;
+        HttpRequest request_;
+        HttpResponse response_;
     }
 
     this(nxt_unit_request_info_t* requestInfo)
     {
-        request_ = FreeListRef!HttpRequest(requestInfo);
-        response_ = FreeListRef!HttpResponse(requestInfo);
-        response_.setBodyAndHeaders(response_);
-
-        scope(exit)
-        {
-            enforce!InvalidOperationException(response_.body_, "No body!");
-            enforce!InvalidOperationException(response_.headers_, "No headers!");
-        }
+        request_ = new HttpRequest(requestInfo);
+        response_ = new HttpResponse(requestInfo);
     }
 
     HttpRequest request()
@@ -263,7 +255,7 @@ enum UnitLogLevel : uint
 {
     private 
     {    
-        FreeListRef!HttpRequestBodyStream body_;
+        InputStream body_;
         HttpHeadersDictionary headers_;
         string path_;
         string method_;
@@ -277,7 +269,7 @@ enum UnitLogLevel : uint
         path_ = requestValues.path;
         method_ = requestValues.method;
         headers_ = requestValues.headers;
-        body_ = FreeListRef!HttpRequestBodyStream(this.requestInfo);
+        body_ = new HttpRequestBodyStream(this.requestInfo);
     }
 
     private static RequestValues getRequestValues(
@@ -496,23 +488,19 @@ private Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
 {
     private
     {
-        FreeListRef!HttpResponseBody body_;
+        HttpResponseBody body_;
         string contentType_;
         bool hasStarted_ = false;
-        FreeListRef!HttpResponseHeaders headers_;
+        HttpResponseHeaders headers_;
         nxt_unit_request_info_t* requestInfo_;
         ushort statusCode_;
     }
 
     this(nxt_unit_request_info_t* requestInfo)
     {
+        body_ = new HttpResponseBody(this);
+        headers_ = new HttpResponseHeaders(this);
         requestInfo_ = requestInfo;
-    }
-
-    void setBodyAndHeaders(FreeListRef!HttpResponse httpResponse)
-    {
-        body_ = FreeListRef!HttpResponseBody(httpResponse);
-        headers_ = FreeListRef!HttpResponseHeaders(httpResponse);
     }
 
     HttpResponseBody body()
@@ -633,11 +621,11 @@ private @safe class HttpResponseHeaders
     private
     {
         HttpHeadersDictionary httpHeaders_;
-        FreeListRef!HttpResponse httpResponse;
+        HttpResponse httpResponse;
         ulong length_;
     }
 
-    this(FreeListRef!HttpResponse httpResponse)
+    this(HttpResponse httpResponse)
     {
         httpHeaders_ = HttpHeadersDictionary();
         this.httpResponse = httpResponse;
@@ -730,10 +718,10 @@ private alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
     private
     {
         bool hasFinalized = false;
-        FreeListRef!HttpResponse httpResponse;
+        HttpResponse httpResponse;
     }
 
-    this(FreeListRef!HttpResponse httpResponse)
+    this(HttpResponse httpResponse)
     {
         this.httpResponse = httpResponse;
     }
