@@ -8,15 +8,12 @@ import vibe.stream.operations : readAllUTF8;
 int main(string[] args) @safe
 {
     auto app = WebApplication.create();
-    // map doesn't do any routing today and only supports setting a single handler app-wide.
-    return app
-           .map("", &handler)
-           .run();
+    app.mapGet("/", &handler).withName("index");
+    app.mapGet("/test/", &handler).withName("no-route-values");
+    app.mapGet("/hello/<name>/<int:age>/", &handler).withName("route-values");
+    return app.run();
 }
 
-// We need extern(C) here to satisfy an implementation detail of hutia's NGINX Unit
-// integration. In a future version this requirement won't be imposed on users.
-extern(C)
 string handler(HttpContext httpContext) @safe
 {
     auto httpRequest = httpContext.request;

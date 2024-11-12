@@ -9,11 +9,13 @@
 	"targetType": "library",
 	"dependencies": {
 		"eventcore": "~>0.9.34",
+		"pegged": "~>0.4.9",
 		"vibe-d:http": "~>0.10.1",
 	},
 	"dflags": [
 		"--preview=dip1000",
 	],
+	"sourceFolders": ["source/hutia_internal/"],
     "configurations": {
         "apple": {
             "platforms": [

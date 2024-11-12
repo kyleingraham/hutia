@@ -1,41 +1,62 @@
+import core.lifetime : copyEmplace;
 import core.stdc.string : memcpy;
 import eventcore.driver : IOMode;
+import pegged.peg : ParseTree;
 import std.algorithm.comparison : min;
-import std.array : Appender;
+import std.algorithm.searching : endsWith;
+import std.array : Appender, join, replace, replaceFirst;
 import std.concurrency : ownerTid, receive, receiveOnly, spawn;
 import std.conv : to;
 import std.exception : enforce;
 import std.format : format;
+import std.range.primitives : back;
+import std.regex : matchAll, regex, Regex;
 import std.string : toStringz;
-import std.typecons : Nullable, Tuple;
+import std.traits : isBasicType, isCallable, isSomeString, moduleName, Parameters,
+                    ReturnType;
+import std.typecons : Nullable, tuple, Tuple;
+import std.uuid : UUID;
+import std.variant : Variant;
 import unit_integration;
 import vibe.container.dictionarylist : DictionaryList;
 import vibe.core.concurrency : send;
 import vibe.core.core : exitEventLoop, runApplication, runTask;
+import vibe.core.log : logTrace;
 import vibe.core.task : Task;
 import vibe.core.stream : InputStream;
+import vibe.http.common : HTTPMethod, httpMethodFromString;
+import vibe.inet.webform : parseURLEncodedForm;
 
 @safe class WebApplication
 {
-    this(){}
+    private
+    {
+        Router router;
+    }
+
+    this()
+    {
+        router = new Router();
+    }
 
     static WebApplication create()
     {
         return new WebApplication();
     }
 
-    WebApplication map(string route, RequestFunction handler)
+    EndpointCustomizer mapGet(Handler)(string route, Handler handler)
     {
-        setHandler(handler);
-        return this;
+        return router.map(route, HTTPMethod.GET, handler);
     }
 
-    int run()
+    int run() @trusted
     {
-        auto webAppContext = WebApplicationContext();
-        (() @trusted => spawn(&runUnit, webAppContext))();
+        (() @trusted => spawn(&runUnit))();
 
-        dispatcherTask = runTask(&runDispatcher);
+        dispatcherTask = runTask(
+            &runDispatcher,
+            router.toImmutable()
+        );
 
         runApplication();
 
@@ -45,7 +66,7 @@ import vibe.core.stream : InputStream;
 
 private shared Task dispatcherTask;
 
-private void runDispatcher() @safe nothrow
+private void runDispatcher(immutable(Router) router) @safe nothrow
 {
     bool shouldRun = true;
 
@@ -53,7 +74,7 @@ private void runDispatcher() @safe nothrow
     {
         void requestInfoHandler(RequestInfoMessage message)
         {
-            dispatch(message);
+            dispatch(message, router);
         }
 
         void cancelHandler(CancelMessage message)
@@ -96,20 +117,25 @@ nxt_unit_request_info_t* getRequestInfo(
     return cast(nxt_unit_request_info_t*)requestInfo;
 }
 
-private void dispatch(RequestInfoMessage message) @safe
+private void dispatch(RequestInfoMessage message, immutable(Router) router) @safe
 {
-    runTask((nxt_unit_request_info_t* requestInfo) nothrow {
+    runTask((nxt_unit_request_info_t* requestInfo, immutable(Router) router) nothrow {
         try
         {
             auto httpContext = new HttpContext(requestInfo);
-            scope (exit)
-            {
-                httpContext.response.complete();
-            }
+            // TODO: should middleware complete?
+            scope(exit) httpContext.response.complete();
 
-            httpContext.response.body.write(
-                getHandler()(httpContext)
-            );
+            auto handler = router.getHandler(httpContext);
+
+            if (handler.isNull)
+            {
+                // TODO: move this to middleware
+                if (!httpContext.response.hasStarted)
+                    httpContext.response.statusCode = 404;
+            }
+            else
+                handler.get()(httpContext);
         }
         catch (Exception e)
         {
@@ -117,12 +143,12 @@ private void dispatch(RequestInfoMessage message) @safe
              * Any uncaught exception while writing the repsonse should result in the
              * request being finalized gracefully. Ideally there is another layer above
              * this ensuring the status code is updated to a 500. Uncaught exceptions
-             * will break Unit.
+             * will break Unit. TODO: move this to middleware
              * */
             auto message = (() @trusted => getExceptionMessage(e))();
             logUnit(requestInfo.ctx, UnitLogLevel.alert, message);
         }
-    }, getRequestInfo(message.requestInfo));
+    }, getRequestInfo(message.requestInfo), router);
 }
 
 private string getExceptionMessage(Throwable e) @system nothrow
@@ -137,30 +163,9 @@ private string getExceptionMessage(Throwable e) @system nothrow
         return e.msg;
 }
 
-private alias RequestFunction = extern(C) string function(HttpContext) @safe;
+private alias RequestFunction = string function(HttpContext) @safe;
 
-private shared Nullable!RequestFunction handler;
-
-private void setHandler(RequestFunction newHandler) @safe
-{
-    synchronized
-    {
-        if ((cast(Nullable!RequestFunction)handler).isNull)
-            handler = Nullable!RequestFunction(newHandler);
-        else
-            throw new InvalidOperationException("Cannot set handler more than once");
-    }
-}
-
-private const(RequestFunction) getHandler() @safe
-{
-    return (cast(Nullable!RequestFunction)handler).get;
-}
-
-extern(C)
-private @safe struct WebApplicationContext{}
-
-private void runUnit(const(WebApplicationContext) webAppContext) @system
+private void runUnit() @system
 {
     int rc;
     nxt_unit_init_t init;
@@ -259,6 +264,8 @@ enum UnitLogLevel : uint
         HttpHeadersDictionary headers_;
         string path_;
         string method_;
+        string[string] routeValues_;
+        Nullable!QueryStringDictionary queryString_;
         nxt_unit_request_info_t* requestInfo;
     }
 
@@ -278,7 +285,7 @@ enum UnitLogLevel : uint
     {
         auto unitRequest = requestInfo.request;
         auto path = (() @trusted => getString(
-            &unitRequest.target, unitRequest.target_length
+            &unitRequest.path, unitRequest.path_length
         ))();
         auto method = (() @trusted => getString(
             &unitRequest.method, unitRequest.method_length
@@ -314,11 +321,34 @@ enum UnitLogLevel : uint
         return path_;
     }
 
+    const(QueryStringDictionary) queryString()
+    {
+        QueryStringDictionary temp;
+
+        if (queryString_.isNull)
+        {
+            auto unitQuery = (() @trusted => getString(
+                &requestInfo.request.query, requestInfo.request.query_length
+            ))();
+            parseURLEncodedForm(unitQuery, temp);
+            queryString_ = temp;
+        }
+
+        return queryString_.get();
+    }
+
+    const(string[string]) routeValues()
+    {
+        return routeValues_;
+    }
+
     override string toString()
     {
         return "HttpRequest(\"" ~ method ~ "\", \"" ~ path ~ "\")";
     }
 }
+
+alias QueryStringDictionary = DictionaryList!(string,true,16L,false);
 
 private string getString(nxt_unit_sptr_t* stringPointer, size_t length) @system
 {
@@ -748,6 +778,9 @@ private alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
 
         hasFinalized = true;
 
+        if (!httpResponse.hasStarted)
+            (() @trusted => httpResponse.writeHeaders())();
+
         (() @trusted => nxt_unit_request_done(
             httpResponse.requestInfo(),
             unitReturnCode
@@ -851,5 +884,342 @@ private @safe struct ResponseData
         this.returnCode = returnCode;
         auto message = msg ~ " with return code " ~ to!string(returnCode);
         super(message, file, line);
+    }
+}
+
+/**
+ * ROUTING
+ * */
+
+PathConverterSpec[] defaultPathConverters = [
+    pathConverter!int("int", "[0-9]+"),
+    pathConverter!string("string", "[^/]+"),
+    pathConverter!string("slug", "[-a-zA-Z0-9_]+"),
+    pathConverter!UUID(
+        "uuid",
+        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    ),
+    pathConverter!string("path", ".+")
+];
+
+struct PathConverterSpec
+{
+    string converterPathName;
+    string regex;
+    ToDDelegate toDDelegate;
+    ToPathDelegate toPathDelegate;
+}
+
+private alias ToDDelegate = Variant delegate(string value) @safe;
+private alias ToPathDelegate = string delegate(Variant value) @safe;
+
+PathConverterSpec pathConverter(
+    ConversionType
+)(string converterPathName, string regex) @safe
+{
+    ToDDelegate tdd = (value) @trusted {
+        return Variant(to!ConversionType(value));
+    };
+
+    ToPathDelegate tpd = (value) @trusted {
+        return to!string(value.get!ConversionType());
+    };
+
+    return PathConverterSpec(converterPathName, regex, tdd, tpd);
+}
+
+alias RouteName = string;
+
+private @safe class Router
+{
+    private
+    {
+        PathConverterSpec[string] converterMap;
+        ParsedPath[RouteName] pathMap;
+        Route[][HTTPMethod] routes;
+    }
+
+    this()
+    {
+        addPathConverters();
+        //useRoutingMiddleware();
+        //useHandlerMiddleware();
+    }
+
+    private this(
+        immutable PathConverterSpec[string] converterMap,
+        immutable ParsedPath[RouteName] pathMap,
+        immutable Route[][HTTPMethod] routes
+    ) immutable
+    {
+        this.converterMap = converterMap;
+        this.pathMap = pathMap;
+        this.routes = routes;
+    }
+
+    immutable(Router) toImmutable() @system
+    {
+        return new immutable Router(
+            cast(immutable)this.converterMap,
+            cast(immutable)this.pathMap,
+            cast(immutable)this.routes
+        );
+    }
+
+    Nullable!HandlerDelegate getHandler(HttpContext httpContext) inout
+    {
+        auto httpMethod = httpMethodFromString(httpContext.request.method);
+
+        auto methodPresent = httpMethod in routes;
+
+        if (methodPresent is null)
+            return Nullable!HandlerDelegate();
+
+        Regex!char pathRegexCopy;
+
+        foreach (route; routes[httpMethod])
+        {
+            auto matches = matchAll(httpContext.request.path, route.pathRegex);
+
+            if (matches.empty())
+                continue;
+
+            // Copy immutable members to call mutable method
+            (() @trusted => pathRegexCopy = cast(Regex!char)route.pathRegex)();
+
+            // TODO: min 2k req/s penalty for routes with values
+            foreach (i; 0 .. pathRegexCopy.namedCaptures.length)
+                httpContext.request.routeValues_[pathRegexCopy.namedCaptures[i]] =
+                    matches.captures[pathRegexCopy.namedCaptures[i]];
+
+            return Nullable!HandlerDelegate((httpContext) {
+                route.handler(httpContext, route.pathCaptureGroups);
+            });
+        }
+
+        return Nullable!HandlerDelegate();
+    }
+
+    EndpointCustomizer map(H)(
+        string path,
+        HTTPMethod method,
+        H handler
+    )
+    {
+        static assert(isCallable!H, H, " must be a function or a delegate.");
+
+        auto parsedPath = parsePath(path, true);
+
+        RouterHandlerDelegate hd = (httpContext, pathCaptureGroups) @safe {
+            static if (
+                Parameters!(handler).length == 1
+                && is(Parameters!H[0] : HttpContext)
+                && is(ReturnType!H : string)
+            )
+            {
+                httpContext.response.body.write(
+                    handler(httpContext)
+                );
+            }
+            else
+                static assert(0, H, " is not a valid handler");
+        };
+
+        auto methodPresent = method in routes;
+
+        if (methodPresent is null)
+            routes[method] = [];
+
+        // Single-line mode works hand-in-hand with $ to exclude trailing slashes when
+        // matching.
+        routes[method] ~= Route(
+            regex(parsedPath.regexPath, "s"), hd, parsedPath.pathCaptureGroups
+        );
+
+        logTrace("Added %s route: %s", to!string(method), routes[method].back);
+
+        rehashMaps();
+
+        return new EndpointCustomizer(parsedPath, this);
+    }
+
+    private void rehashMaps() @trusted
+    {
+        converterMap = converterMap.rehash();
+        //pathMap = pathMap.rehash();
+        routes = routes.rehash();
+    }
+
+    void addPathConverters(PathConverterSpec[] pathConverters = [])
+    {
+        // This method must be called before adding handlers.
+        foreach (pathConverter; [defaultPathConverters, pathConverters].join)
+        {
+            converterMap[pathConverter.converterPathName] = pathConverter;
+        }
+    }
+
+    // Do not run this at run time. Too slow.
+    ParsedPath parsePath(string path, bool isEndpoint=false)
+    {
+        import pegged.grammar;
+
+        // Regex can be compiled at compile-time but can't be used. pegged to the rescue.
+        mixin(grammar(`
+Path:
+    PathCaptureGroups   <- ((;UrlChars PathCaptureGroup?) / (PathCaptureGroup ;UrlChars) / (PathCaptureGroup ;endOfInput))*
+    UrlChars            <- [A-Za-z0-9-._~/]+
+    PathCaptureGroup    <- '<' (ConverterPathName ':')? PathParameter '>'
+    ConverterPathName   <- identifier
+    PathParameter       <- identifier
+`));
+
+        auto peggedPath = Path(path);
+        auto pathCaptureGroups = getCaptureGroups(peggedPath);
+
+        return ParsedPath(
+            path,
+            getRegexPath(path, pathCaptureGroups, isEndpoint),
+            pathCaptureGroups
+        );
+    }
+
+    private PathCaptureGroup[] getCaptureGroups(ParseTree p)
+    {
+        PathCaptureGroup[] walkForGroups(ParseTree p)
+        {
+            import std.array : join;
+
+            switch (p.name)
+            {
+                case "Path":
+                    return walkForGroups(p.children[0]);
+
+                case "Path.PathCaptureGroups":
+                    PathCaptureGroup[] result = [];
+                    foreach (child; p.children)
+                        result ~= walkForGroups(child);
+
+                    return result;
+
+                case "Path.PathCaptureGroup":
+                    if (p.children.length == 1)
+                    {
+                        // No path converter specified so we default to 'string'
+                        return [PathCaptureGroup("string", p[0].matches[0], p.matches.join)];
+                    }
+
+                    else return [PathCaptureGroup(p[0].matches[0], p[1].matches[0], p.matches.join)];
+
+                default:
+                    assert(false);
+            }
+        }
+
+        return walkForGroups(p);
+    }
+
+    /**
+    * Convert a path containing named converter captures to one with named regex captures.
+    *
+    * The regex paths produced here are used in:
+    *   - Request route matching
+    *   - Request parameter extraction
+    *
+    * Examples:
+    * ---
+    * // Returns "^\\/hello\\/(?P<name>[^/]+)\\/*$"
+    * getRegexPath("/hello/<string:name>/", [PathCaptureGroup("string", "name", "<string:name>")], true);
+    * ---
+    */
+    private string getRegexPath(string path, PathCaptureGroup[] captureGroups, bool isEndpoint=false)
+    {
+        string result = ("^" ~ path[]).replace("/", r"\/");
+        if (isEndpoint) {
+            if (result.endsWith(r"\/"))
+                result = result ~ "*"; // If the route ends in a '/' we make it optional.
+
+            result = result ~ "$";
+        }
+
+        foreach (group; captureGroups)
+        {
+            result = result.replaceFirst(
+                group.rawCaptureGroup,
+                getRegexCaptureGroup(group.converterPathName, group.pathParameter)
+            );
+        }
+
+        return result;
+    }
+
+    private string getRegexCaptureGroup(string converterPathName, string pathParameter)
+    {
+        auto converterRegistered = converterPathName in converterMap;
+        if (!converterRegistered)
+            throw new ImproperlyConfigured("No path converter registered for '" ~ converterPathName ~ "'.");
+
+        return "(?P<" ~ pathParameter ~ ">" ~ converterMap[converterPathName].regex ~ ")";
+    }
+}
+
+// https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.builder.routingendpointconventionbuilderextensions.withname?view=aspnetcore-8.0
+@safe class EndpointCustomizer
+{
+    private
+    {
+        ParsedPath parsedPath;
+        Router router;
+    }
+
+    this(ParsedPath parsedPath, Router router)
+    {
+        this.parsedPath = parsedPath;
+        this.router = router;
+    }
+
+    EndpointCustomizer withName(string name)
+    {
+        router.pathMap[name] = parsedPath;
+        router.rehashMaps();
+        return this;
+    }
+}
+
+private struct Route
+{
+    Regex!char pathRegex;
+    RouterHandlerDelegate handler;
+    PathCaptureGroup[] pathCaptureGroups;
+}
+
+private alias HandlerDelegate = void delegate(
+    HttpContext httpContext
+) @safe;
+
+private alias RouterHandlerDelegate = void delegate(
+    HttpContext httpContext,
+    inout PathCaptureGroup[] pathCaptureGroups
+) @safe;
+
+private struct ParsedPath
+{
+    string path;
+    string regexPath;
+    PathCaptureGroup[] pathCaptureGroups;
+}
+
+package struct PathCaptureGroup
+{
+    string converterPathName;
+    string pathParameter;
+    string rawCaptureGroup;
+}
+
+class ImproperlyConfigured : Exception
+{
+    this(string msg, string file = __FILE__, size_t line = __LINE__) @safe
+    {
+        super(msg, file, line);
     }
 }
