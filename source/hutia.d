@@ -1,19 +1,17 @@
-import core.lifetime : copyEmplace;
 import core.stdc.string : memcpy;
 import eventcore.driver : IOMode;
-import pegged.peg : ParseTree;
+import std.algorithm : startsWith;
 import std.algorithm.comparison : min;
 import std.algorithm.searching : endsWith;
-import std.array : Appender, join, replace, replaceFirst;
+import std.array : Appender, join, split;
 import std.concurrency : ownerTid, receive, receiveOnly, spawn;
 import std.conv : to;
 import std.exception : enforce;
 import std.format : format;
-import std.range.primitives : back;
-import std.regex : matchAll, regex, Regex;
+import std.range : empty;
+import std.regex : matchFirst, regex, Regex;
 import std.string : toStringz;
-import std.traits : isBasicType, isCallable, isSomeString, moduleName, Parameters,
-                    ReturnType;
+import std.traits : isCallable, Parameters, ParameterIdentifierTuple, ReturnType;
 import std.typecons : Nullable, tuple, Tuple;
 import std.uuid : UUID;
 import std.variant : Variant;
@@ -44,9 +42,9 @@ import vibe.inet.webform : parseURLEncodedForm;
         return new WebApplication();
     }
 
-    EndpointCustomizer mapGet(Handler)(string route, Handler handler)
+    EndpointCustomizer mapGet(alias handler)(string routeTemplate)
     {
-        return router.map(route, HTTPMethod.GET, handler);
+        return router.mapImpl!(handler)(routeTemplate, HTTPMethod.GET);
     }
 
     int run() @trusted
@@ -576,6 +574,9 @@ private Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
             "Cannot write headers for a request more than once"
         );
 
+        if (!statusCode_)
+            statusCode_ = 200;
+
         headers_.setDefault("Content-Type", "text/html; charset=utf-8");
 
         hasStarted_ = true;
@@ -891,41 +892,215 @@ private @safe struct ResponseData
  * ROUTING
  * */
 
-PathConverterSpec[] defaultPathConverters = [
-    pathConverter!int("int", "[0-9]+"),
-    pathConverter!string("string", "[^/]+"),
-    pathConverter!string("slug", "[-a-zA-Z0-9_]+"),
-    pathConverter!UUID(
+RouteConstraint[] defaultRouteConstraints = [
+    routeConstraint!int("int", "[0-9]+"),
+    routeConstraint!string("string", "[^/]+"),
+    routeConstraint!string("slug", "[-a-zA-Z0-9_]+"),
+    routeConstraint!UUID(
         "uuid",
         "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
     ),
-    pathConverter!string("path", ".+")
+    routeConstraint!string("path", ".+")
 ];
 
-struct PathConverterSpec
+struct RouteConstraint
 {
-    string converterPathName;
+    string name;
     string regex;
-    ToDDelegate toDDelegate;
-    ToPathDelegate toPathDelegate;
+    FromRouteDelegate fromRouteDelegate;
+    ToRouteDelegate toRouteDelegate;
 }
 
-private alias ToDDelegate = Variant delegate(string value) @safe;
-private alias ToPathDelegate = string delegate(Variant value) @safe;
+alias FromRouteDelegate = Variant delegate(string value) @safe;
+alias ToRouteDelegate = string delegate(Variant value) @safe;
 
-PathConverterSpec pathConverter(
-    ConversionType
-)(string converterPathName, string regex) @safe
+RouteConstraint routeConstraint(
+    ConstraintType
+)(string name, string regex) @safe
 {
-    ToDDelegate tdd = (value) @trusted {
-        return Variant(to!ConversionType(value));
+    FromRouteDelegate frd = (value) @trusted {
+        return Variant(to!ConstraintType(value));
     };
 
-    ToPathDelegate tpd = (value) @trusted {
-        return to!string(value.get!ConversionType());
+    ToRouteDelegate trd = (value) @trusted {
+        return to!string(value.get!ConstraintType());
     };
 
-    return PathConverterSpec(converterPathName, regex, tdd, tpd);
+    return RouteConstraint(name, regex, frd, trd);
+}
+
+private @safe class TrieNode {
+    string staticSegment;           // Fixed path segment (e.g. "hello")
+    Regex!char dynamicSegmentRegex; // Regex for dynamic segments (e.g. <string:name>)
+    string dynamicSegmentName;      // Name of a dynamic segment (e.g. "name")
+    string dynamicConstraintKey;    // Constraint key for a dynamic segment (e.g. "string")
+    TrieRouterHandler handler;      // Route handler if isTerminal=true
+    TrieNode[string] children;      // Child nodes
+    bool isTerminal;                // True if this node has no children
+
+    this(string staticSegment = "") {
+        this.staticSegment = staticSegment;
+    }
+}
+
+private alias TrieRouterHandler = void delegate(
+    HttpContext httpContext,
+    CapturedValueData capturedValueData
+) @safe;
+
+private alias RouteParameter = string;
+private alias RouteValue = string;
+private alias RouteConstraintName = string;
+
+private @safe struct CapturedValueData
+{
+    RouteValue[RouteParameter] capturedValues;
+    RouteConstraintName[RouteParameter] capturedValueConstraints;
+}
+
+private alias TrieRouterMatch = Nullable!(
+    Tuple!(
+        TrieRouterHandler,
+        "handler",
+        CapturedValueData,
+        "capturedValueData"
+    )
+);
+
+private @safe class TrieRouter {
+    private TrieNode root = new TrieNode();
+
+    void addRoute(
+        string routeTemplate,
+        TrieRouterHandler handler,
+        RouteConstraint[RouteConstraintName] constraints
+    )
+    {
+        auto segments = routeTemplate.split('/');
+        auto currentNode = root;
+
+        foreach (segment; segments) {
+            if (segment.empty) continue;
+
+            if (segment.startsWith("{") && segment.endsWith("}"))
+            {
+                // Handle dynamic segments' route constraints
+                // Dynamic nodes are reference by routeParameter
+                auto parts = segment[1 .. $ - 1].split(':');
+                string routeConstraintName;
+                string routeParameter;
+
+                if (parts.length == 2)
+                {
+                    routeParameter = parts[0];
+                    routeConstraintName = parts[1];
+                }
+                else if (parts.length == 1)
+                {
+                    routeParameter = parts[0];
+                    routeConstraintName = "string";
+                }
+                else
+                    throw new ImproperlyConfigured(
+                        format("Invalid route constraint %s", segment)
+                    );
+
+                auto routeConstraintPtr = routeConstraintName in constraints;
+                if (!routeConstraintPtr)
+                {
+                    throw new ImproperlyConfigured(
+                        "Route constraint for `" ~ routeConstraintName ~ "` not found"
+                    );
+                }
+                auto routeConstraint = *routeConstraintPtr;
+
+                if (!(routeParameter in currentNode.children))
+                {
+                    auto dynamicNode = new TrieNode();
+                    dynamicNode.dynamicSegmentRegex = regex(routeConstraint.regex);
+                    dynamicNode.dynamicSegmentName = routeParameter;
+                    dynamicNode.dynamicConstraintKey = routeConstraintName;
+                    currentNode.children[routeParameter] = dynamicNode;
+                }
+
+                currentNode = currentNode.children[routeParameter];
+            } else
+            {
+                // Handle static segments
+                // Static nodes are reference by segment
+                if (!(segment in currentNode.children)) {
+                    currentNode.children[segment] = new TrieNode(segment);
+                }
+                currentNode = currentNode.children[segment];
+            }
+        }
+
+        // Terminal node so we set a handler
+        currentNode.isTerminal = true;
+        currentNode.handler = handler;
+    }
+
+    TrieRouterMatch match(string path) inout
+    {
+        auto segments = path.split('/');
+        inout(TrieNode)* currentNode = &root;
+
+        RouteValue[RouteParameter] capturedValues;
+        RouteConstraintName[RouteParameter] capturedValueConstraints;
+
+        foreach (segment; segments) {
+            if (segment.empty) continue;
+
+            bool matched = false;
+
+            // Check static children
+            auto childNode = segment in currentNode.children;
+            if (childNode)
+            {
+                currentNode = &(*childNode);
+                matched = true;
+            }
+            else
+            {
+                // Check dynamic children in trie
+                foreach (key, _; currentNode.children)
+                {
+                    auto child = currentNode.children[key];
+                    if (child.dynamicSegmentRegex !is Regex!char.init
+                        && matchFirst(segment, child.dynamicSegmentRegex))
+                    {
+                        // We matched on a dynamic segment
+                        // Save the route value against the route parameter
+                        capturedValues[child.dynamicSegmentName] = segment;
+                        // Save the constraint name against the route parameter
+                        capturedValueConstraints[child.dynamicSegmentName] =
+                            child.dynamicConstraintKey;
+                        // Pointer to AA entry instead of loop variable.
+                        // Helps with lifetime issues in loop.
+                        currentNode = &currentNode.children[key];
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!matched) {
+                return TrieRouterMatch();
+            }
+        }
+
+        if (currentNode.isTerminal)
+        {
+            return TrieRouterMatch(
+                tuple!("handler", "capturedValueData")(
+                    cast(TrieRouterHandler)currentNode.handler,
+                    CapturedValueData(capturedValues, capturedValueConstraints)
+                )
+            );
+        }
+
+        return TrieRouterMatch();
+    }
 }
 
 alias RouteName = string;
@@ -934,34 +1109,28 @@ private @safe class Router
 {
     private
     {
-        PathConverterSpec[string] converterMap;
-        ParsedPath[RouteName] pathMap;
-        Route[][HTTPMethod] routes;
+        RouteConstraint[RouteConstraintName] constraints;
+        TrieRouter[HTTPMethod] routes;
     }
 
     this()
     {
-        addPathConverters();
-        //useRoutingMiddleware();
-        //useHandlerMiddleware();
+        addRouteContraints();
     }
 
     private this(
-        immutable PathConverterSpec[string] converterMap,
-        immutable ParsedPath[RouteName] pathMap,
-        immutable Route[][HTTPMethod] routes
+        immutable RouteConstraint[RouteConstraintName] constraints,
+        immutable TrieRouter[HTTPMethod] routes
     ) immutable
     {
-        this.converterMap = converterMap;
-        this.pathMap = pathMap;
+        this.constraints = constraints;
         this.routes = routes;
     }
 
     immutable(Router) toImmutable() @system
     {
         return new immutable Router(
-            cast(immutable)this.converterMap,
-            cast(immutable)this.pathMap,
+            cast(immutable)this.constraints,
             cast(immutable)this.routes
         );
     }
@@ -975,245 +1144,161 @@ private @safe class Router
         if (methodPresent is null)
             return Nullable!HandlerDelegate();
 
-        Regex!char pathRegexCopy;
+        auto trieRouter = routes[httpMethod];
+        auto trieRouterMatch = trieRouter.match(httpContext.request.path);
+        if (trieRouterMatch.isNull)
+            return Nullable!HandlerDelegate();
 
-        foreach (route; routes[httpMethod])
-        {
-            auto matches = matchAll(httpContext.request.path, route.pathRegex);
+        auto capturedValueData = trieRouterMatch.get().capturedValueData;
 
-            if (matches.empty())
-                continue;
+        foreach (capturedValue; capturedValueData.capturedValues.byKeyValue())
+            httpContext.request.routeValues_[capturedValue.key] = capturedValue.value;
 
-            // Copy immutable members to call mutable method
-            (() @trusted => pathRegexCopy = cast(Regex!char)route.pathRegex)();
-
-            // TODO: min 2k req/s penalty for routes with values
-            foreach (i; 0 .. pathRegexCopy.namedCaptures.length)
-                httpContext.request.routeValues_[pathRegexCopy.namedCaptures[i]] =
-                    matches.captures[pathRegexCopy.namedCaptures[i]];
-
-            return Nullable!HandlerDelegate((httpContext) {
-                route.handler(httpContext, route.pathCaptureGroups);
-            });
-        }
-
-        return Nullable!HandlerDelegate();
+        return Nullable!HandlerDelegate((httpContext) {
+            trieRouterMatch.get().handler(httpContext, capturedValueData);
+        });
     }
 
-    EndpointCustomizer map(H)(
-        string path,
-        HTTPMethod method,
-        H handler
+    EndpointCustomizer mapImpl(alias handler)(
+        string routeTemplate,
+        HTTPMethod httpMethod
     )
     {
-        static assert(isCallable!H, H, " must be a function or a delegate.");
+        // ParameterIdentifierTuple returns empty strings. Alternatives do as well:
+        // https://forum.dlang.org/post/mailman.1197.1379014886.1719.digitalmars-d-learn@puremagic.com
+        // Apparently, identifiers aren't guaranteed for function pointers and delegates:
+        // https://github.com/dlang/phobos/pull/3620
 
-        auto parsedPath = parsePath(path, true);
+        static assert(isCallable!handler, handler, " must be a callable.");
 
-        RouterHandlerDelegate hd = (httpContext, pathCaptureGroups) @safe {
+        TrieRouterHandler trh = (httpContext, capturedValueData) @safe {
             static if (
+                Parameters!(handler).length == 0
+                && is(ReturnType!handler : string)
+            )
+            {
+                httpContext.response.body.write(
+                    handler()
+                );
+            }
+            else static if (
                 Parameters!(handler).length == 1
-                && is(Parameters!H[0] : HttpContext)
-                && is(ReturnType!H : string)
+                && is(Parameters!handler[0] : HttpContext)
+                && is(ReturnType!handler : string)
             )
             {
                 httpContext.response.body.write(
                     handler(httpContext)
                 );
             }
+            else static if (
+                1 < Parameters!(handler).length
+                && is(ReturnType!handler : string)
+            )
+            {
+                auto args = tuple!(Parameters!(handler));
+                static if(is(typeof(handler) Params == __parameters))
+                static foreach(idx, _; Params)
+                {
+                    static if (is(Params[idx] : HttpContext))
+                        args[idx] = httpContext;
+                    else static if (
+                        0 < __traits(getAttributes, Params[idx .. idx + 1]).length
+                        && is(typeof(__traits(getAttributes, Params[idx .. idx + 1])[0]) == FromRoute)
+                    )
+                    {
+                        args[idx] = (
+                            __traits(getAttributes, Params[idx .. idx + 1])[0].routeParameter is null ?
+                            FromRoute(ParameterIdentifierTuple!handler[idx]) :
+                            __traits(getAttributes, Params[idx .. idx + 1])[0]
+                        ).get!(
+                            Parameters!handler[idx]
+                        )(
+                            httpContext.request,
+                            this,
+                            capturedValueData
+                        );
+                    }
+                    else
+                        static assert(
+                            0, Parameters!handler[idx], " is not a valid argument type"
+                        );
+                }
+
+                httpContext.response.body.write(
+                    handler(args.expand)
+                );
+            }
             else
-                static assert(0, H, " is not a valid handler");
+                static assert(0, handler, " is not a valid handler");
         };
 
-        auto methodPresent = method in routes;
+        auto methodPresent = httpMethod in routes;
 
         if (methodPresent is null)
-            routes[method] = [];
+            routes[httpMethod] = new TrieRouter();
 
-        // Single-line mode works hand-in-hand with $ to exclude trailing slashes when
-        // matching.
-        routes[method] ~= Route(
-            regex(parsedPath.regexPath, "s"), hd, parsedPath.pathCaptureGroups
-        );
+        routes[httpMethod].addRoute(routeTemplate, trh, constraints);
 
-        logTrace("Added %s route: %s", to!string(method), routes[method].back);
+        logTrace("Added %s route: %s", to!string(httpMethod), routeTemplate);
 
         rehashMaps();
 
-        return new EndpointCustomizer(parsedPath, this);
+        return new EndpointCustomizer();
     }
 
     private void rehashMaps() @trusted
     {
-        converterMap = converterMap.rehash();
-        //pathMap = pathMap.rehash();
+        constraints = constraints.rehash();
         routes = routes.rehash();
     }
 
-    void addPathConverters(PathConverterSpec[] pathConverters = [])
+    void addRouteContraints(RouteConstraint[] routeContraints = [])
     {
         // This method must be called before adding handlers.
-        foreach (pathConverter; [defaultPathConverters, pathConverters].join)
+        foreach (routeConstraint; [defaultRouteConstraints, routeContraints].join)
         {
-            converterMap[pathConverter.converterPathName] = pathConverter;
+            constraints[routeConstraint.name] = routeConstraint;
         }
-    }
-
-    // Do not run this at run time. Too slow.
-    ParsedPath parsePath(string path, bool isEndpoint=false)
-    {
-        import pegged.grammar;
-
-        // Regex can be compiled at compile-time but can't be used. pegged to the rescue.
-        mixin(grammar(`
-Path:
-    PathCaptureGroups   <- ((;UrlChars PathCaptureGroup?) / (PathCaptureGroup ;UrlChars) / (PathCaptureGroup ;endOfInput))*
-    UrlChars            <- [A-Za-z0-9-._~/]+
-    PathCaptureGroup    <- '<' (ConverterPathName ':')? PathParameter '>'
-    ConverterPathName   <- identifier
-    PathParameter       <- identifier
-`));
-
-        auto peggedPath = Path(path);
-        auto pathCaptureGroups = getCaptureGroups(peggedPath);
-
-        return ParsedPath(
-            path,
-            getRegexPath(path, pathCaptureGroups, isEndpoint),
-            pathCaptureGroups
-        );
-    }
-
-    private PathCaptureGroup[] getCaptureGroups(ParseTree p)
-    {
-        PathCaptureGroup[] walkForGroups(ParseTree p)
-        {
-            import std.array : join;
-
-            switch (p.name)
-            {
-                case "Path":
-                    return walkForGroups(p.children[0]);
-
-                case "Path.PathCaptureGroups":
-                    PathCaptureGroup[] result = [];
-                    foreach (child; p.children)
-                        result ~= walkForGroups(child);
-
-                    return result;
-
-                case "Path.PathCaptureGroup":
-                    if (p.children.length == 1)
-                    {
-                        // No path converter specified so we default to 'string'
-                        return [PathCaptureGroup("string", p[0].matches[0], p.matches.join)];
-                    }
-
-                    else return [PathCaptureGroup(p[0].matches[0], p[1].matches[0], p.matches.join)];
-
-                default:
-                    assert(false);
-            }
-        }
-
-        return walkForGroups(p);
-    }
-
-    /**
-    * Convert a path containing named converter captures to one with named regex captures.
-    *
-    * The regex paths produced here are used in:
-    *   - Request route matching
-    *   - Request parameter extraction
-    *
-    * Examples:
-    * ---
-    * // Returns "^\\/hello\\/(?P<name>[^/]+)\\/*$"
-    * getRegexPath("/hello/<string:name>/", [PathCaptureGroup("string", "name", "<string:name>")], true);
-    * ---
-    */
-    private string getRegexPath(string path, PathCaptureGroup[] captureGroups, bool isEndpoint=false)
-    {
-        string result = ("^" ~ path[]).replace("/", r"\/");
-        if (isEndpoint) {
-            if (result.endsWith(r"\/"))
-                result = result ~ "*"; // If the route ends in a '/' we make it optional.
-
-            result = result ~ "$";
-        }
-
-        foreach (group; captureGroups)
-        {
-            result = result.replaceFirst(
-                group.rawCaptureGroup,
-                getRegexCaptureGroup(group.converterPathName, group.pathParameter)
-            );
-        }
-
-        return result;
-    }
-
-    private string getRegexCaptureGroup(string converterPathName, string pathParameter)
-    {
-        auto converterRegistered = converterPathName in converterMap;
-        if (!converterRegistered)
-            throw new ImproperlyConfigured("No path converter registered for '" ~ converterPathName ~ "'.");
-
-        return "(?P<" ~ pathParameter ~ ">" ~ converterMap[converterPathName].regex ~ ")";
     }
 }
 
 // https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.builder.routingendpointconventionbuilderextensions.withname?view=aspnetcore-8.0
 @safe class EndpointCustomizer
 {
-    private
-    {
-        ParsedPath parsedPath;
-        Router router;
-    }
-
-    this(ParsedPath parsedPath, Router router)
-    {
-        this.parsedPath = parsedPath;
-        this.router = router;
-    }
-
     EndpointCustomizer withName(string name)
     {
-        router.pathMap[name] = parsedPath;
-        router.rehashMaps();
+        // TODO: implement
         return this;
     }
-}
-
-private struct Route
-{
-    Regex!char pathRegex;
-    RouterHandlerDelegate handler;
-    PathCaptureGroup[] pathCaptureGroups;
 }
 
 private alias HandlerDelegate = void delegate(
     HttpContext httpContext
 ) @safe;
 
-private alias RouterHandlerDelegate = void delegate(
-    HttpContext httpContext,
-    inout PathCaptureGroup[] pathCaptureGroups
-) @safe;
-
-private struct ParsedPath
+@safe struct FromRoute
 {
-    string path;
-    string regexPath;
-    PathCaptureGroup[] pathCaptureGroups;
-}
+    string routeParameter;
 
-package struct PathCaptureGroup
-{
-    string converterPathName;
-    string pathParameter;
-    string rawCaptureGroup;
+    T get(T)(
+        HttpRequest httpRequest,
+        Router router,
+        CapturedValueData capturedValueData
+    )
+    {
+        // Set value from request route
+        // At the time this is called there is no way we will have key errors
+        // Route values will be in place
+        // TODO: How did this compile with `HttpRequest HttpRequest` in the constructor?
+        // TODO: Better message for non-existent route/query name.
+        auto routeConstraintName =
+            capturedValueData.capturedValueConstraints[routeParameter];
+        auto routeConstraint = router.constraints[routeConstraintName];
+        return (() @trusted => routeConstraint.fromRouteDelegate(
+            httpRequest.routeValues[routeParameter]
+        ).get!T())();
+    }
 }
 
 class ImproperlyConfigured : Exception

@@ -1,4 +1,4 @@
-import hutia : HttpContext, logError, WebApplication;
+import hutia : HttpContext, logError, FromRoute, WebApplication;
 import std.array : Appender;
 import std.format : format;
 import std.random : uniform;
@@ -8,13 +8,32 @@ import vibe.stream.operations : readAllUTF8;
 int main(string[] args) @safe
 {
     auto app = WebApplication.create();
-    app.mapGet("/", &handler).withName("index");
-    app.mapGet("/test/", &handler).withName("no-route-values");
-    app.mapGet("/hello/<name>/<int:age>/", &handler).withName("route-values");
+    app.mapGet!simpleHandler("/");
+    app.mapGet!parameterBindingHandler("/parameter-binding/{name}/{age:int}/");
+    app.mapGet!useContextHandler("/use-context/");
     return app.run();
 }
 
-string handler(HttpContext httpContext) @safe
+string simpleHandler() @safe
+{
+    return "Hello, World!\n";
+}
+
+string parameterBindingHandler(
+    @FromRoute() string name,
+    @FromRoute("age") int ageInYears
+) @safe
+{
+    return (() @trusted => format(
+        "Received name of type `%s` with value '%s' and age of type `%s` with value '%s'!\n",
+        typeof(name).stringof,
+        name,
+        typeof(ageInYears).stringof,
+        ageInYears
+    ))();
+}
+
+string useContextHandler(HttpContext httpContext) @safe
 {
     auto httpRequest = httpContext.request;
 
