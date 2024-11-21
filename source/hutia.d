@@ -9,7 +9,7 @@ import std.conv : to;
 import std.exception : enforce;
 import std.format : format;
 import std.range : empty;
-import std.regex : matchFirst, regex, Regex;
+import std.regex : ctRegex, matchFirst, Regex;
 import std.string : toStringz;
 import std.traits : isCallable, Parameters, ParameterIdentifierTuple, ReturnType;
 import std.typecons : Nullable, tuple, Tuple;
@@ -893,31 +893,36 @@ private @safe struct ResponseData
  * */
 
 RouteConstraint[] defaultRouteConstraints = [
-    routeConstraint!int("int", "[0-9]+"),
-    routeConstraint!string("string", "[^/]+"),
-    routeConstraint!string("slug", "[-a-zA-Z0-9_]+"),
-    routeConstraint!UUID(
-        "uuid",
-        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-    ),
-    routeConstraint!string("path", ".+")
+    routeConstraint!(int, "[0-9]+")("int"),
+    routeConstraint!(string, "[^/]+")("string"),
+    routeConstraint!(string, "[-a-zA-Z0-9_]+")("slug"),
+    routeConstraint!(
+        UUID, "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    )("uuid"),
+    routeConstraint!(string, ".+")("path")
 ];
 
 struct RouteConstraint
 {
     string name;
-    string regex;
+    RegexDelegate regexDelegate;
     FromRouteDelegate fromRouteDelegate;
     ToRouteDelegate toRouteDelegate;
 }
 
+alias RegexDelegate = bool delegate(string value) @safe;
 alias FromRouteDelegate = Variant delegate(string value) @safe;
 alias ToRouteDelegate = string delegate(Variant value) @safe;
 
 RouteConstraint routeConstraint(
-    ConstraintType
-)(string name, string regex) @safe
+    ConstraintType, string regex
+)(string name) @safe
 {
+    RegexDelegate rd = (value) {
+        auto ctr = ctRegex!regex;
+        return 0 < value.matchFirst(ctr).length;
+    };
+
     FromRouteDelegate frd = (value) @trusted {
         return Variant(to!ConstraintType(value));
     };
@@ -926,17 +931,17 @@ RouteConstraint routeConstraint(
         return to!string(value.get!ConstraintType());
     };
 
-    return RouteConstraint(name, regex, frd, trd);
+    return RouteConstraint(name, rd, frd, trd);
 }
 
 private @safe class TrieNode {
-    string staticSegment;           // Fixed path segment (e.g. "hello")
-    Regex!char dynamicSegmentRegex; // Regex for dynamic segments (e.g. <string:name>)
-    string dynamicSegmentName;      // Name of a dynamic segment (e.g. "name")
-    string dynamicConstraintKey;    // Constraint key for a dynamic segment (e.g. "string")
-    TrieRouterHandler handler;      // Route handler if isTerminal=true
-    TrieNode[string] children;      // Child nodes
-    bool isTerminal;                // True if this node has no children
+    string staticSegment; // Fixed path segment (e.g. "hello")
+    RegexDelegate dynamicSegmentMatch; // Dynamic segment regex matcher (e.g. <string:name>)
+    string dynamicSegmentName; // Name of a dynamic segment (e.g. "name")
+    string dynamicConstraintKey; // Constraint key for a dynamic segment (e.g. "string")
+    TrieRouterHandler handler; // Route handler if isTerminal=true
+    TrieNode[string] children; // Child nodes
+    bool isTerminal;  // True if this node has no children
 
     this(string staticSegment = "") {
         this.staticSegment = staticSegment;
@@ -1017,7 +1022,7 @@ private @safe class TrieRouter {
                 if (!(routeParameter in currentNode.children))
                 {
                     auto dynamicNode = new TrieNode();
-                    dynamicNode.dynamicSegmentRegex = regex(routeConstraint.regex);
+                    dynamicNode.dynamicSegmentMatch = routeConstraint.regexDelegate;
                     dynamicNode.dynamicSegmentName = routeParameter;
                     dynamicNode.dynamicConstraintKey = routeConstraintName;
                     currentNode.children[routeParameter] = dynamicNode;
@@ -1066,8 +1071,8 @@ private @safe class TrieRouter {
                 foreach (key, _; currentNode.children)
                 {
                     auto child = currentNode.children[key];
-                    if (child.dynamicSegmentRegex !is Regex!char.init
-                        && matchFirst(segment, child.dynamicSegmentRegex))
+                    if (child.dynamicSegmentMatch !is null
+                        && child.dynamicSegmentMatch(segment))
                     {
                         // We matched on a dynamic segment
                         // Save the route value against the route parameter
