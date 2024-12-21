@@ -126,6 +126,7 @@ private void dispatch(RequestInfoMessage message, immutable(Router) router) @saf
         try
         {
             auto httpContext = new HttpContext(requestInfo);
+
             // TODO: should middleware complete?
             scope(exit) httpContext.response.complete();
 
