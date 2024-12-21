@@ -5,8 +5,8 @@ import std.algorithm.comparison : min;
 import std.algorithm.searching : endsWith;
 import std.array : Appender, join, split;
 import std.concurrency : ownerTid, receive, receiveOnly, spawn;
-import std.conv : to;
-import std.exception : enforce;
+import std.conv : ConvException, to;
+import std.exception : basicExceptionCtors, enforce;
 import std.format : format;
 import std.range : empty;
 import std.regex : ctRegex, matchFirst, Regex;
@@ -115,6 +115,11 @@ nxt_unit_request_info_t* getRequestInfo(
     return cast(nxt_unit_request_info_t*)requestInfo;
 }
 
+string addRequestContext(string exceptionMessage, HttpRequest request)
+{
+    return exceptionMessage ~ " [path='" ~ request.path ~ "']";
+}
+
 private void dispatch(RequestInfoMessage message, immutable(Router) router) @safe
 {
     runTask((nxt_unit_request_info_t* requestInfo, immutable(Router) router) nothrow {
@@ -124,16 +129,28 @@ private void dispatch(RequestInfoMessage message, immutable(Router) router) @saf
             // TODO: should middleware complete?
             scope(exit) httpContext.response.complete();
 
-            auto handler = router.getHandler(httpContext);
+            try
+            {
+                auto handler = router.getHandler(httpContext);
 
-            if (handler.isNull)
+                if (handler.isNull)
+                {
+                    // TODO: move this to middleware
+                    if (!httpContext.response.hasStarted)
+                        httpContext.response.statusCode = 404;
+                }
+                else
+                    handler.get()(httpContext);
+            }
+            catch (Exception e)
             {
                 // TODO: move this to middleware
                 if (!httpContext.response.hasStarted)
-                    httpContext.response.statusCode = 404;
+                        httpContext.response.statusCode = 500;
+
+                e.msg = addRequestContext(e.msg, httpContext.request);
+                throw e;
             }
-            else
-                handler.get()(httpContext);
         }
         catch (Exception e)
         {
@@ -262,7 +279,7 @@ enum UnitLogLevel : uint
         HttpHeadersDictionary headers_;
         string path_;
         string method_;
-        string[string] routeValues_;
+        RouteValue[RouteParameter] routeValues_;
         Nullable!QueryStringDictionary queryString_;
         nxt_unit_request_info_t* requestInfo;
     }
@@ -335,7 +352,8 @@ enum UnitLogLevel : uint
         return queryString_.get();
     }
 
-    const(string[string]) routeValues()
+    // Raw route values keyed by developer-controlled route template parameters.
+    const(RouteValue[RouteParameter]) routeValues()
     {
         return routeValues_;
     }
@@ -924,11 +942,21 @@ RouteConstraint routeConstraint(
     };
 
     FromRouteDelegate frd = (value) @trusted {
-        return Variant(to!ConstraintType(value));
+        try
+            return Variant(to!ConstraintType(value));
+        catch (ConvException)
+            throw new InternalServerErrorException(
+                "Cannot convert '" ~ value ~ "' to " ~ ConstraintType.stringof
+            );
     };
 
     ToRouteDelegate trd = (value) @trusted {
-        return to!string(value.get!ConstraintType());
+        try
+            return to!string(value.get!ConstraintType());
+        catch (ConvException)
+            throw new InternalServerErrorException(
+                "Cannot convert " ~ ConstraintType.stringof ~ " to string"
+            );
     };
 
     return RouteConstraint(name, rd, frd, trd);
@@ -959,7 +987,9 @@ private alias RouteConstraintName = string;
 
 private @safe struct CapturedValueData
 {
+    // Raw values from route.
     RouteValue[RouteParameter] capturedValues;
+    // Constraints for converting raw values.
     RouteConstraintName[RouteParameter] capturedValueConstraints;
 }
 
@@ -1212,6 +1242,10 @@ private @safe class Router
                         && is(typeof(__traits(getAttributes, Params[idx .. idx + 1])[0]) == FromRoute)
                     )
                     {
+                        // FromRoute.routeParameter is set at route handler or left null.
+                        // When it is left null we set it to the current handler parameter
+                        // name. In both cases they can differ from the route definition.
+                        // We validate in FromRoute.
                         args[idx] = (
                             __traits(getAttributes, Params[idx .. idx + 1])[0].routeParameter is null ?
                             FromRoute(ParameterIdentifierTuple!handler[idx]) :
@@ -1258,9 +1292,9 @@ private @safe class Router
         routes = routes.rehash();
     }
 
+    // This method must be called before adding handlers.
     void addRouteContraints(RouteConstraint[] routeContraints = [])
     {
-        // This method must be called before adding handlers.
         foreach (routeConstraint; [defaultRouteConstraints, routeContraints].join)
         {
             constraints[routeConstraint.name] = routeConstraint;
@@ -1284,6 +1318,9 @@ private alias HandlerDelegate = void delegate(
 
 @safe struct FromRoute
 {
+    // The identifier for finding a route constraint to convert a corresponding route
+    // value. This is developer-controlled via handler parameter definitions and
+    // might not match the route definitions. We validate in `get` for this mismatch.
     string routeParameter;
 
     T get(T)(
@@ -1292,24 +1329,53 @@ private alias HandlerDelegate = void delegate(
         CapturedValueData capturedValueData
     )
     {
-        // Set value from request route
-        // At the time this is called there is no way we will have key errors
-        // Route values will be in place
         // TODO: How did this compile with `HttpRequest HttpRequest` in the constructor?
-        // TODO: Better message for non-existent route/query name.
+        enforce!(InvalidOperationException)(
+            routeParameter in capturedValueData.capturedValueConstraints,
+            (() @trusted => format(
+                unknownRouteParameterMessage,
+                routeParameter
+            ))()
+        );
         auto routeConstraintName =
             capturedValueData.capturedValueConstraints[routeParameter];
+
+        // Captured value constraint names come from the known list in the step above.
+        // No need to double-check.
         auto routeConstraint = router.constraints[routeConstraintName];
+
+        enforce!(InvalidOperationException)(
+            routeParameter in httpRequest.routeValues,
+            (() @trusted => format(
+                unknownRouteParameterMessage,
+                routeParameter
+            ))()
+        );
         return (() @trusted => routeConstraint.fromRouteDelegate(
             httpRequest.routeValues[routeParameter]
         ).get!T())();
     }
 }
 
+enum unknownRouteParameterMessage = "'%s' is not a known route parameter. This usually happens when a handler's bound parameter's identifier does not match a route parameter.";
+
 class ImproperlyConfigured : Exception
 {
-    this(string msg, string file = __FILE__, size_t line = __LINE__) @safe
-    {
-        super(msg, file, line);
-    }
+    ///
+    mixin basicExceptionCtors;
+}
+
+// HTTP status exceptions. Subclass these to get specific status codes
+// when using HTTP error middleware.
+
+class BadHttpRequestException : Exception
+{
+    ///
+    mixin basicExceptionCtors;
+}
+
+class InternalServerErrorException: Exception
+{
+    ///
+    mixin basicExceptionCtors;
 }
