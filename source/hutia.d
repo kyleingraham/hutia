@@ -1,41 +1,60 @@
 import core.stdc.string : memcpy;
 import eventcore.driver : IOMode;
+import std.algorithm : startsWith;
 import std.algorithm.comparison : min;
-import std.array : Appender;
+import std.algorithm.searching : endsWith;
+import std.array : Appender, join, split;
 import std.concurrency : ownerTid, receive, receiveOnly, spawn;
-import std.conv : to;
-import std.exception : enforce;
+import std.conv : ConvException, to;
+import std.exception : basicExceptionCtors, enforce;
 import std.format : format;
+import std.range : empty;
+import std.regex : ctRegex, matchFirst, Regex;
 import std.string : toStringz;
-import std.typecons : Nullable, Tuple;
+import std.traits : isCallable, Parameters, ParameterIdentifierTuple, ReturnType;
+import std.typecons : Nullable, tuple, Tuple;
+import std.uuid : UUID;
+import std.variant : Variant;
 import unit_integration;
 import vibe.container.dictionarylist : DictionaryList;
 import vibe.core.concurrency : send;
 import vibe.core.core : exitEventLoop, runApplication, runTask;
+import vibe.core.log : logTrace;
 import vibe.core.task : Task;
 import vibe.core.stream : InputStream;
+import vibe.http.common : HTTPMethod, httpMethodFromString;
+import vibe.inet.webform : parseURLEncodedForm;
 
 @safe class WebApplication
 {
-    this(){}
+    private
+    {
+        Router router;
+    }
+
+    this()
+    {
+        router = new Router();
+    }
 
     static WebApplication create()
     {
         return new WebApplication();
     }
 
-    WebApplication map(string route, RequestFunction handler)
+    EndpointCustomizer mapGet(alias handler)(string routeTemplate)
     {
-        setHandler(handler);
-        return this;
+        return router.mapImpl!(handler)(routeTemplate, HTTPMethod.GET);
     }
 
-    int run()
+    int run() @trusted
     {
-        auto webAppContext = WebApplicationContext();
-        (() @trusted => spawn(&runUnit, webAppContext))();
+        (() @trusted => spawn(&runUnit))();
 
-        dispatcherTask = runTask(&runDispatcher);
+        dispatcherTask = runTask(
+            &runDispatcher,
+            router.toImmutable()
+        );
 
         runApplication();
 
@@ -45,7 +64,7 @@ import vibe.core.stream : InputStream;
 
 private shared Task dispatcherTask;
 
-private void runDispatcher() @safe nothrow
+private void runDispatcher(immutable(Router) router) @safe nothrow
 {
     bool shouldRun = true;
 
@@ -53,7 +72,7 @@ private void runDispatcher() @safe nothrow
     {
         void requestInfoHandler(RequestInfoMessage message)
         {
-            dispatch(message);
+            dispatch(message, router);
         }
 
         void cancelHandler(CancelMessage message)
@@ -96,20 +115,43 @@ nxt_unit_request_info_t* getRequestInfo(
     return cast(nxt_unit_request_info_t*)requestInfo;
 }
 
-private void dispatch(RequestInfoMessage message) @safe
+string addRequestContext(string exceptionMessage, HttpRequest request)
 {
-    runTask((nxt_unit_request_info_t* requestInfo) nothrow {
+    return exceptionMessage ~ " [path='" ~ request.path ~ "']";
+}
+
+private void dispatch(RequestInfoMessage message, immutable(Router) router) @safe
+{
+    runTask((nxt_unit_request_info_t* requestInfo, immutable(Router) router) nothrow {
         try
         {
             auto httpContext = new HttpContext(requestInfo);
-            scope (exit)
-            {
-                httpContext.response.complete();
-            }
 
-            httpContext.response.body.write(
-                getHandler()(httpContext)
-            );
+            // TODO: should middleware complete?
+            scope(exit) httpContext.response.complete();
+
+            try
+            {
+                auto handler = router.getHandler(httpContext);
+
+                if (handler.isNull)
+                {
+                    // TODO: move this to middleware
+                    if (!httpContext.response.hasStarted)
+                        httpContext.response.statusCode = 404;
+                }
+                else
+                    handler.get()(httpContext);
+            }
+            catch (Exception e)
+            {
+                // TODO: move this to middleware
+                if (!httpContext.response.hasStarted)
+                        httpContext.response.statusCode = 500;
+
+                e.msg = addRequestContext(e.msg, httpContext.request);
+                throw e;
+            }
         }
         catch (Exception e)
         {
@@ -117,12 +159,12 @@ private void dispatch(RequestInfoMessage message) @safe
              * Any uncaught exception while writing the repsonse should result in the
              * request being finalized gracefully. Ideally there is another layer above
              * this ensuring the status code is updated to a 500. Uncaught exceptions
-             * will break Unit.
+             * will break Unit. TODO: move this to middleware
              * */
             auto message = (() @trusted => getExceptionMessage(e))();
             logUnit(requestInfo.ctx, UnitLogLevel.alert, message);
         }
-    }, getRequestInfo(message.requestInfo));
+    }, getRequestInfo(message.requestInfo), router);
 }
 
 private string getExceptionMessage(Throwable e) @system nothrow
@@ -137,30 +179,9 @@ private string getExceptionMessage(Throwable e) @system nothrow
         return e.msg;
 }
 
-private alias RequestFunction = extern(C) string function(HttpContext) @safe;
+private alias RequestFunction = string function(HttpContext) @safe;
 
-private shared Nullable!RequestFunction handler;
-
-private void setHandler(RequestFunction newHandler) @safe
-{
-    synchronized
-    {
-        if ((cast(Nullable!RequestFunction)handler).isNull)
-            handler = Nullable!RequestFunction(newHandler);
-        else
-            throw new InvalidOperationException("Cannot set handler more than once");
-    }
-}
-
-private const(RequestFunction) getHandler() @safe
-{
-    return (cast(Nullable!RequestFunction)handler).get;
-}
-
-extern(C)
-private @safe struct WebApplicationContext{}
-
-private void runUnit(const(WebApplicationContext) webAppContext) @system
+private void runUnit() @system
 {
     int rc;
     nxt_unit_init_t init;
@@ -259,6 +280,8 @@ enum UnitLogLevel : uint
         HttpHeadersDictionary headers_;
         string path_;
         string method_;
+        RouteValue[RouteParameter] routeValues_;
+        Nullable!QueryStringDictionary queryString_;
         nxt_unit_request_info_t* requestInfo;
     }
 
@@ -278,7 +301,7 @@ enum UnitLogLevel : uint
     {
         auto unitRequest = requestInfo.request;
         auto path = (() @trusted => getString(
-            &unitRequest.target, unitRequest.target_length
+            &unitRequest.path, unitRequest.path_length
         ))();
         auto method = (() @trusted => getString(
             &unitRequest.method, unitRequest.method_length
@@ -314,11 +337,35 @@ enum UnitLogLevel : uint
         return path_;
     }
 
+    const(QueryStringDictionary) queryString()
+    {
+        QueryStringDictionary temp;
+
+        if (queryString_.isNull)
+        {
+            auto unitQuery = (() @trusted => getString(
+                &requestInfo.request.query, requestInfo.request.query_length
+            ))();
+            parseURLEncodedForm(unitQuery, temp);
+            queryString_ = temp;
+        }
+
+        return queryString_.get();
+    }
+
+    // Raw route values keyed by developer-controlled route template parameters.
+    const(RouteValue[RouteParameter]) routeValues()
+    {
+        return routeValues_;
+    }
+
     override string toString()
     {
         return "HttpRequest(\"" ~ method ~ "\", \"" ~ path ~ "\")";
     }
 }
+
+alias QueryStringDictionary = DictionaryList!(string,true,16L,false);
 
 private string getString(nxt_unit_sptr_t* stringPointer, size_t length) @system
 {
@@ -546,6 +593,9 @@ private Nullable!ulong getContentLength(nxt_unit_request_t* unitRequest) @safe
             "Cannot write headers for a request more than once"
         );
 
+        if (!statusCode_)
+            statusCode_ = 200;
+
         headers_.setDefault("Content-Type", "text/html; charset=utf-8");
 
         hasStarted_ = true;
@@ -748,6 +798,9 @@ private alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
 
         hasFinalized = true;
 
+        if (!httpResponse.hasStarted)
+            (() @trusted => httpResponse.writeHeaders())();
+
         (() @trusted => nxt_unit_request_done(
             httpResponse.requestInfo(),
             unitReturnCode
@@ -852,4 +905,478 @@ private @safe struct ResponseData
         auto message = msg ~ " with return code " ~ to!string(returnCode);
         super(message, file, line);
     }
+}
+
+/**
+ * ROUTING
+ * */
+
+RouteConstraint[] defaultRouteConstraints = [
+    routeConstraint!(int, "[0-9]+")("int"),
+    routeConstraint!(string, "[^/]+")("string"),
+    routeConstraint!(string, "[-a-zA-Z0-9_]+")("slug"),
+    routeConstraint!(
+        UUID, "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    )("uuid"),
+    routeConstraint!(string, ".+")("path")
+];
+
+struct RouteConstraint
+{
+    string name;
+    RegexDelegate regexDelegate;
+    FromRouteDelegate fromRouteDelegate;
+    ToRouteDelegate toRouteDelegate;
+}
+
+alias RegexDelegate = bool delegate(string value) @safe;
+alias FromRouteDelegate = Variant delegate(string value) @safe;
+alias ToRouteDelegate = string delegate(Variant value) @safe;
+
+RouteConstraint routeConstraint(
+    ConstraintType, string regex
+)(string name) @safe
+{
+    RegexDelegate rd = (value) {
+        auto ctr = ctRegex!regex;
+        return 0 < value.matchFirst(ctr).length;
+    };
+
+    FromRouteDelegate frd = (value) @trusted {
+        try
+            return Variant(to!ConstraintType(value));
+        catch (ConvException)
+            throw new InternalServerErrorException(
+                "Cannot convert '" ~ value ~ "' to " ~ ConstraintType.stringof
+            );
+    };
+
+    ToRouteDelegate trd = (value) @trusted {
+        try
+            return to!string(value.get!ConstraintType());
+        catch (ConvException)
+            throw new InternalServerErrorException(
+                "Cannot convert " ~ ConstraintType.stringof ~ " to string"
+            );
+    };
+
+    return RouteConstraint(name, rd, frd, trd);
+}
+
+private @safe class TrieNode {
+    string staticSegment; // Fixed path segment (e.g. "hello")
+    RegexDelegate dynamicSegmentMatch; // Dynamic segment regex matcher (e.g. <string:name>)
+    string dynamicSegmentName; // Name of a dynamic segment (e.g. "name")
+    string dynamicConstraintKey; // Constraint key for a dynamic segment (e.g. "string")
+    TrieRouterHandler handler; // Route handler if isTerminal=true
+    TrieNode[string] children; // Child nodes
+    bool isTerminal;  // True if this node has no children
+
+    this(string staticSegment = "") {
+        this.staticSegment = staticSegment;
+    }
+}
+
+private alias TrieRouterHandler = void delegate(
+    HttpContext httpContext,
+    CapturedValueData capturedValueData
+) @safe;
+
+private alias RouteParameter = string;
+private alias RouteValue = string;
+private alias RouteConstraintName = string;
+
+private @safe struct CapturedValueData
+{
+    // Raw values from route.
+    RouteValue[RouteParameter] capturedValues;
+    // Constraints for converting raw values.
+    RouteConstraintName[RouteParameter] capturedValueConstraints;
+}
+
+private alias TrieRouterMatch = Nullable!(
+    Tuple!(
+        TrieRouterHandler,
+        "handler",
+        CapturedValueData,
+        "capturedValueData"
+    )
+);
+
+private @safe class TrieRouter {
+    private TrieNode root = new TrieNode();
+
+    void addRoute(
+        string routeTemplate,
+        TrieRouterHandler handler,
+        RouteConstraint[RouteConstraintName] constraints
+    )
+    {
+        auto segments = routeTemplate.split('/');
+        auto currentNode = root;
+
+        foreach (segment; segments) {
+            if (segment.empty) continue;
+
+            if (segment.startsWith("{") && segment.endsWith("}"))
+            {
+                // Handle dynamic segments' route constraints
+                // Dynamic nodes are reference by routeParameter
+                auto parts = segment[1 .. $ - 1].split(':');
+                string routeConstraintName;
+                string routeParameter;
+
+                if (parts.length == 2)
+                {
+                    routeParameter = parts[0];
+                    routeConstraintName = parts[1];
+                }
+                else if (parts.length == 1)
+                {
+                    routeParameter = parts[0];
+                    routeConstraintName = "string";
+                }
+                else
+                    throw new ImproperlyConfigured(
+                        format("Invalid route constraint %s", segment)
+                    );
+
+                auto routeConstraintPtr = routeConstraintName in constraints;
+                if (!routeConstraintPtr)
+                {
+                    throw new ImproperlyConfigured(
+                        "Route constraint for `" ~ routeConstraintName ~ "` not found"
+                    );
+                }
+                auto routeConstraint = *routeConstraintPtr;
+
+                if (!(routeParameter in currentNode.children))
+                {
+                    auto dynamicNode = new TrieNode();
+                    dynamicNode.dynamicSegmentMatch = routeConstraint.regexDelegate;
+                    dynamicNode.dynamicSegmentName = routeParameter;
+                    dynamicNode.dynamicConstraintKey = routeConstraintName;
+                    currentNode.children[routeParameter] = dynamicNode;
+                }
+
+                currentNode = currentNode.children[routeParameter];
+            } else
+            {
+                // Handle static segments
+                // Static nodes are reference by segment
+                if (!(segment in currentNode.children)) {
+                    currentNode.children[segment] = new TrieNode(segment);
+                }
+                currentNode = currentNode.children[segment];
+            }
+        }
+
+        // Terminal node so we set a handler
+        currentNode.isTerminal = true;
+        currentNode.handler = handler;
+    }
+
+    TrieRouterMatch match(string path) inout
+    {
+        auto segments = path.split('/');
+        inout(TrieNode)* currentNode = &root;
+
+        RouteValue[RouteParameter] capturedValues;
+        RouteConstraintName[RouteParameter] capturedValueConstraints;
+
+        foreach (segment; segments) {
+            if (segment.empty) continue;
+
+            bool matched = false;
+
+            // Check static children
+            auto childNode = segment in currentNode.children;
+            if (childNode)
+            {
+                currentNode = &(*childNode);
+                matched = true;
+            }
+            else
+            {
+                // Check dynamic children in trie
+                foreach (key, _; currentNode.children)
+                {
+                    auto child = currentNode.children[key];
+                    if (child.dynamicSegmentMatch !is null
+                        && child.dynamicSegmentMatch(segment))
+                    {
+                        // We matched on a dynamic segment
+                        // Save the route value against the route parameter
+                        capturedValues[child.dynamicSegmentName] = segment;
+                        // Save the constraint name against the route parameter
+                        capturedValueConstraints[child.dynamicSegmentName] =
+                            child.dynamicConstraintKey;
+                        // Pointer to AA entry instead of loop variable.
+                        // Helps with lifetime issues in loop.
+                        currentNode = &currentNode.children[key];
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!matched) {
+                return TrieRouterMatch();
+            }
+        }
+
+        if (currentNode.isTerminal)
+        {
+            return TrieRouterMatch(
+                tuple!("handler", "capturedValueData")(
+                    cast(TrieRouterHandler)currentNode.handler,
+                    CapturedValueData(capturedValues, capturedValueConstraints)
+                )
+            );
+        }
+
+        return TrieRouterMatch();
+    }
+}
+
+alias RouteName = string;
+
+private @safe class Router
+{
+    private
+    {
+        RouteConstraint[RouteConstraintName] constraints;
+        TrieRouter[HTTPMethod] routes;
+    }
+
+    this()
+    {
+        addRouteContraints();
+    }
+
+    private this(
+        immutable RouteConstraint[RouteConstraintName] constraints,
+        immutable TrieRouter[HTTPMethod] routes
+    ) immutable
+    {
+        this.constraints = constraints;
+        this.routes = routes;
+    }
+
+    immutable(Router) toImmutable() @system
+    {
+        return new immutable Router(
+            cast(immutable)this.constraints,
+            cast(immutable)this.routes
+        );
+    }
+
+    Nullable!HandlerDelegate getHandler(HttpContext httpContext) inout
+    {
+        auto httpMethod = httpMethodFromString(httpContext.request.method);
+
+        auto methodPresent = httpMethod in routes;
+
+        if (methodPresent is null)
+            return Nullable!HandlerDelegate();
+
+        auto trieRouter = routes[httpMethod];
+        auto trieRouterMatch = trieRouter.match(httpContext.request.path);
+        if (trieRouterMatch.isNull)
+            return Nullable!HandlerDelegate();
+
+        auto capturedValueData = trieRouterMatch.get().capturedValueData;
+
+        foreach (capturedValue; capturedValueData.capturedValues.byKeyValue())
+            httpContext.request.routeValues_[capturedValue.key] = capturedValue.value;
+
+        return Nullable!HandlerDelegate((httpContext) {
+            trieRouterMatch.get().handler(httpContext, capturedValueData);
+        });
+    }
+
+    EndpointCustomizer mapImpl(alias handler)(
+        string routeTemplate,
+        HTTPMethod httpMethod
+    )
+    {
+        // ParameterIdentifierTuple returns empty strings. Alternatives do as well:
+        // https://forum.dlang.org/post/mailman.1197.1379014886.1719.digitalmars-d-learn@puremagic.com
+        // Apparently, identifiers aren't guaranteed for function pointers and delegates:
+        // https://github.com/dlang/phobos/pull/3620
+
+        static assert(isCallable!handler, handler, " must be a callable.");
+
+        TrieRouterHandler trh = (httpContext, capturedValueData) @safe {
+            static if (
+                Parameters!(handler).length == 0
+                && is(ReturnType!handler : string)
+            )
+            {
+                httpContext.response.body.write(
+                    handler()
+                );
+            }
+            else static if (
+                Parameters!(handler).length == 1
+                && is(Parameters!handler[0] : HttpContext)
+                && is(ReturnType!handler : string)
+            )
+            {
+                httpContext.response.body.write(
+                    handler(httpContext)
+                );
+            }
+            else static if (
+                1 < Parameters!(handler).length
+                && is(ReturnType!handler : string)
+            )
+            {
+                auto args = tuple!(Parameters!(handler));
+                static if(is(typeof(handler) Params == __parameters))
+                static foreach(idx, _; Params)
+                {
+                    static if (is(Params[idx] : HttpContext))
+                        args[idx] = httpContext;
+                    else static if (
+                        0 < __traits(getAttributes, Params[idx .. idx + 1]).length
+                        && is(typeof(__traits(getAttributes, Params[idx .. idx + 1])[0]) == FromRoute)
+                    )
+                    {
+                        // FromRoute.routeParameter is set at route handler or left null.
+                        // When it is left null we set it to the current handler parameter
+                        // name. In both cases they can differ from the route definition.
+                        // We validate in FromRoute.
+                        args[idx] = (
+                            __traits(getAttributes, Params[idx .. idx + 1])[0].routeParameter is null ?
+                            FromRoute(ParameterIdentifierTuple!handler[idx]) :
+                            __traits(getAttributes, Params[idx .. idx + 1])[0]
+                        ).get!(
+                            Parameters!handler[idx]
+                        )(
+                            httpContext.request,
+                            this,
+                            capturedValueData
+                        );
+                    }
+                    else
+                        static assert(
+                            0, Parameters!handler[idx], " is not a valid argument type"
+                        );
+                }
+
+                httpContext.response.body.write(
+                    handler(args.expand)
+                );
+            }
+            else
+                static assert(0, handler, " is not a valid handler");
+        };
+
+        auto methodPresent = httpMethod in routes;
+
+        if (methodPresent is null)
+            routes[httpMethod] = new TrieRouter();
+
+        routes[httpMethod].addRoute(routeTemplate, trh, constraints);
+
+        logTrace("Added %s route: %s", to!string(httpMethod), routeTemplate);
+
+        rehashMaps();
+
+        return new EndpointCustomizer();
+    }
+
+    private void rehashMaps() @trusted
+    {
+        constraints = constraints.rehash();
+        routes = routes.rehash();
+    }
+
+    // This method must be called before adding handlers.
+    void addRouteContraints(RouteConstraint[] routeContraints = [])
+    {
+        foreach (routeConstraint; [defaultRouteConstraints, routeContraints].join)
+        {
+            constraints[routeConstraint.name] = routeConstraint;
+        }
+    }
+}
+
+// https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.builder.routingendpointconventionbuilderextensions.withname?view=aspnetcore-8.0
+@safe class EndpointCustomizer
+{
+    EndpointCustomizer withName(string name)
+    {
+        // TODO: implement
+        return this;
+    }
+}
+
+private alias HandlerDelegate = void delegate(
+    HttpContext httpContext
+) @safe;
+
+@safe struct FromRoute
+{
+    // The identifier for finding a route constraint to convert a corresponding route
+    // value. This is developer-controlled via handler parameter definitions and
+    // might not match the route definitions. We validate in `get` for this mismatch.
+    string routeParameter;
+
+    T get(T)(
+        HttpRequest httpRequest,
+        Router router,
+        CapturedValueData capturedValueData
+    )
+    {
+        // TODO: How did this compile with `HttpRequest HttpRequest` in the constructor?
+        enforce!(InvalidOperationException)(
+            routeParameter in capturedValueData.capturedValueConstraints,
+            (() @trusted => format(
+                unknownRouteParameterMessage,
+                routeParameter
+            ))()
+        );
+        auto routeConstraintName =
+            capturedValueData.capturedValueConstraints[routeParameter];
+
+        // Captured value constraint names come from the known list in the step above.
+        // No need to double-check.
+        auto routeConstraint = router.constraints[routeConstraintName];
+
+        enforce!(InvalidOperationException)(
+            routeParameter in httpRequest.routeValues,
+            (() @trusted => format(
+                unknownRouteParameterMessage,
+                routeParameter
+            ))()
+        );
+        return (() @trusted => routeConstraint.fromRouteDelegate(
+            httpRequest.routeValues[routeParameter]
+        ).get!T())();
+    }
+}
+
+enum unknownRouteParameterMessage = "'%s' is not a known route parameter. This usually happens when a handler's bound parameter's identifier does not match a route parameter.";
+
+class ImproperlyConfigured : Exception
+{
+    ///
+    mixin basicExceptionCtors;
+}
+
+// HTTP status exceptions. Subclass these to get specific status codes
+// when using HTTP error middleware.
+
+class BadHttpRequestException : Exception
+{
+    ///
+    mixin basicExceptionCtors;
+}
+
+class InternalServerErrorException: Exception
+{
+    ///
+    mixin basicExceptionCtors;
 }
