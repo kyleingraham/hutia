@@ -3,7 +3,7 @@
         "Kyle Ingraham"
     ],
     "copyright": "Copyright © 2025, Kyle Ingraham",
-    "description": "Tests hutia's public interface",
+    "description": "Tests Hutia's public interface",
     "license": "MIT",
     "name": "hutia-tests",
     "configurations": [{
