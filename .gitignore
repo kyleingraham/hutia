@@ -3,8 +3,10 @@
 dub.selections.json
 docs.json
 __dummy.html
+bin/
 docs/
 /hutia
+logs/
 libhutia*.so
 libhutia*.dylib
 libhutia*.dll
@@ -12,6 +14,7 @@ libhutia*.a
 libhutia*.lib
 hutia*.lib
 hutia-test-*
+hutia-tests*
 *.exe
 *.pdb
 *.o

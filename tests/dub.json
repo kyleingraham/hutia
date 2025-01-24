@@ -1,0 +1,22 @@
+{
+    "authors": [
+        "Kyle Ingraham"
+    ],
+    "copyright": "Copyright © 2025, Kyle Ingraham",
+    "description": "Tests hutia's public interface",
+    "license": "MIT",
+    "name": "hutia-tests",
+    "configurations": [{
+        "name": "unittest",
+        "targetType": "executable",
+        "mainSourceFile": "source/runner.d",
+        "dependencies": {
+            "hutia": {
+                "version": "*",
+                "path": "../"
+            },
+            "unit-threaded": "~>2.2.0",
+            "vibe-d:http": "~>0.10.1",
+        }
+    }]
+}

@@ -1,9 +1,8 @@
-import hutia : HttpContext, logError, FromRoute, WebApplication;
+import hutia;
 import std.array : Appender;
 import std.format : format;
 import std.random : uniform;
 import std.utf : UTFException;
-import vibe.stream.operations : readAllUTF8;
 
 int main(string[] args) @safe
 {
@@ -25,7 +24,7 @@ string parameterBindingHandler(
 ) @safe
 {
     return (() @trusted => format(
-        "Received name of type `%s` with value '%s' and age of type `%s` with value '%s'!\n",
+        "Received name of type `%s` with value '%s' and age of type `%s` with value %s!\n",
         typeof(name).stringof,
         name,
         typeof(ageInYears).stringof,
@@ -39,7 +38,7 @@ string useContextHandler(HttpContext httpContext) @safe
 
     try
     {
-        auto requestBody = httpRequest.body.readAllUTF8();
+        auto requestBody = httpRequest.body.readToEnd();
     } catch (UTFException e) {
         auto message = (() @trusted => format("handler - %s", e))();
         // D's standard library logger locks Unit. Looks to cause busy-waiting.

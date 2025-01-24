@@ -24,6 +24,7 @@ import vibe.core.task : Task;
 import vibe.core.stream : InputStream;
 import vibe.http.common : HTTPMethod, httpMethodFromString;
 import vibe.inet.webform : parseURLEncodedForm;
+import vibe.stream.operations : readAllUTF8;
 
 @safe class WebApplication
 {
@@ -42,9 +43,29 @@ import vibe.inet.webform : parseURLEncodedForm;
         return new WebApplication();
     }
 
+    EndpointCustomizer map(alias handler)(string routeTemplate)
+    {
+        EndpointCustomizer customizer;
+
+        // Nginx Unit automatically drops bodies from HEAD responses.
+        // TODO: Add OPTIONS middleware. Same one can return 405s?
+        foreach (method; [
+            HTTPMethod.DELETE, HTTPMethod.GET, HTTPMethod.HEAD, HTTPMethod.PATCH,
+            HTTPMethod.OPTIONS, HTTPMethod.POST, HTTPMethod.PUT
+        ])
+            router.mapImpl!(handler)(routeTemplate, method);
+
+        return customizer;
+    }
+
     EndpointCustomizer mapGet(alias handler)(string routeTemplate)
     {
         return router.mapImpl!(handler)(routeTemplate, HTTPMethod.GET);
+    }
+
+    EndpointCustomizer mapPost(alias handler)(string routeTemplate)
+    {
+        return router.mapImpl!(handler)(routeTemplate, HTTPMethod.POST);
     }
 
     int run() @trusted
@@ -56,7 +77,8 @@ import vibe.inet.webform : parseURLEncodedForm;
             router.toImmutable()
         );
 
-        runApplication();
+        string[] nonVibedArgs;
+        runApplication(&nonVibedArgs);
 
         return (() @trusted => receiveOnly!int)();
     }
@@ -809,6 +831,11 @@ private alias HttpHeadersDictionary = DictionaryList!(string,false,12L,false);
             // Halt further response processing now that we have cleaned up the response.
             throw new UnitOperationException(message, unitReturnCode);
     }
+}
+
+string readToEnd(InputStream stream) @safe
+{
+    return stream.readAllUTF8();
 }
 
 private int sendResponse(nxt_unit_request_info_t* requestInfo, string response) @safe

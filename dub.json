@@ -1,20 +1,19 @@
 {
-	"authors": [
-		"Kyle Ingraham"
-	],
-	"copyright": "Copyright © 2024, Kyle Ingraham",
-	"description": "Web framework powered by NGINX Unit.",
-	"license": "MIT",
-	"name": "hutia",
-	"targetType": "library",
-	"dependencies": {
-		"eventcore": "~>0.9.34",
-		"vibe-d:http": "~>0.10.1",
-	},
-	"dflags": [
-		"--preview=dip1000",
-	],
-	"sourceFolders": ["source/hutia_internal/"],
+    "authors": [
+        "Kyle Ingraham"
+    ],
+    "copyright": "Copyright © 2024, Kyle Ingraham",
+    "description": "Web framework powered by NGINX Unit.",
+    "license": "MIT",
+    "name": "hutia",
+    "targetType": "library",
+    "dependencies": {
+        "eventcore": "~>0.9.34",
+        "vibe-d:http": "~>0.10.1",
+    },
+    "dflags": [
+        "--preview=dip1000",
+    ],
     "configurations": {
         "apple": {
             "platforms": [
