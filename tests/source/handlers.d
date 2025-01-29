@@ -37,6 +37,9 @@ unittest
             );
             return data.length;
         };
+        // Using callback prevents `0` statusLine that occurs
+        // when reading statusLine directly. Direct reads can
+        // sometimes occur before the request is complete.
         client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
             statusLine.code.shouldEqual(200);
         };
