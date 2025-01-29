@@ -10,7 +10,7 @@ If you would like to see Hutia in action, take a look at the [examples](examples
 
 ## Testing
 Tests are in the `tests` sub-project.
-- To run tests run `cd tests && dub test`. See `tests` (README)(tests/README.md) for details.
+- To run tests run `cd tests && dub test`. See `tests` [README](tests/README.md) for details.
 
 ## NGINX Unit Integration Details  
 NGINX Unit provides a C API for integrating frameworks directly with Unit's lifecycle. After integration, one can build applications that can be directly managed by Unit which brings:
