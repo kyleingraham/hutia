@@ -192,11 +192,6 @@ class TestResources
         return server.toString();
     }
 
-    string serverPort()
-    {
-        return server.toPortString();
-    }
-
     string controlAddress()
     {
         return control.toString();
