@@ -9,7 +9,7 @@ Here is a simple sample test:
 // This enum prevents having to duplicate the test name.
 enum test8 = "hello-world";
 @(test8) // unit-threaded will name this test __MODULE__.hello-world
-unittest
+@safe unittest // Ensure unit test enforces @safe.
 {
     // Use inNginxUnit for test server code that Unit should invoke.
     if (inNginxUnit())
@@ -31,16 +31,16 @@ unittest
 
         // Use an HTTP client to interact with the test server and
         // run asserts against it.
-        auto client = HTTP("http://" ~ testResources.serverAddress() ~ "/");
-        client.method = HTTP.Method.get;
-        client.onReceive = (ubyte[] data) {
-            (cast(string)data).shouldEqual("Hello, World!\n");
-            return data.length;
-        };
-        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
-            statusLine.code.shouldEqual(200);
-        };
-        client.perform(ThrowOnError.no);
+        makeGetRequest(
+            "http://" ~ testResources.serverAddress() ~ "/",
+            (HTTP.StatusLine statusLine) {
+                statusLine.code.shouldEqual(200);
+            },
+            (ubyte[] data) {
+                (cast(string)data).shouldEqual("Hello, World!\n");
+                return data.length;
+            }
+        );
     }
 }
 ```
