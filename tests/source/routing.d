@@ -3,10 +3,7 @@ import runner;
 import std.conv : to;
 import std.net.curl : HTTP, ThrowOnError;
 import std.traits : EnumMembers;
-import unit_threaded : shouldEqual, ShouldFail, shouldThrowWithMessage;
-import vibe.http.client : requestHTTP;
-import vibe.http.common : HTTPMethod, HTTPStatusException;
-import vibe.stream.operations : readAllUTF8;
+import unit_threaded : shouldEqual, shouldThrowWithMessage;
 
 enum test1 = "mapGet-rejects-non-GET-requests";
 @(test1)

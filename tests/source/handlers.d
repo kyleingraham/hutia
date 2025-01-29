@@ -1,11 +1,12 @@
 import hutia;
 import runner;
 import std.net.curl : HTTP, ThrowOnError;
-import std.traits : EnumMembers;
-import unit_threaded : shouldEqual, ShouldFail;
-import vibe.http.client : requestHTTP;
-import vibe.http.common : HTTPMethod, HTTPStatusException;
-import vibe.stream.operations : readAllUTF8;
+import unit_threaded : shouldEqual;
+
+// Ideally all tests would be @safe but using requestHTTP
+// causes undiagnosed issues with reading entire responses
+// e.g. 'Reached EOF while searching for end marker.'.
+// std.net.curl does not cause issues but is not @safe.
 
 enum test1 = "readToEnd-reads-whole-request-body";
 @(test1)

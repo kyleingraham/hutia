@@ -7,7 +7,7 @@ import std.json : parseJSON;
 import std.process: kill, pipeProcess, Pid, Redirect, tryWait, wait;
 import std.range : back;
 import std.regex : matchFirst;
-import std.socket :SocketOption, SocketOptionLevel, TcpSocket, InternetAddress;
+import std.socket : InternetAddress;
 import std.stdio : writeln;
 import std.string : split;
 import unit_threaded;
@@ -22,15 +22,19 @@ mixin runTestsMain!(
     "handlers",
 );
 
-bool inNginxUnit()
+bool inNginxUnit() @safe
 {
     auto rt = Runtime();
-    return rt.args.canFind(InNginxUnit);
+    return (() @trusted => rt.args.canFind(InNginxUnit))();
 }
 
 enum InNginxUnit = "in-nginx-unit";
 
-TestResources runTestAppInUnit(string testName, string testModule, bool logAccess = false)
+TestResources runTestAppInUnit(
+    string testName,
+    string testModule,
+    bool logAccess = false
+) @safe
 {
     import std.path : absolutePath, buildPath, dirName;
     TestResources testResources = startUnit();
@@ -79,6 +83,7 @@ TestResources runTestAppInUnit(string testName, string testModule, bool logAcces
         );
         writeln("Unit config: ", unitConfig);
         writeln("Sending config to ", testResources.controlAddress(), "...");
+        // TODO: Switch to std.net.curl
         requestHTTP(
             "http://" ~ testResources.controlAddress() ~ "/config",
             (scope req) {
@@ -108,7 +113,7 @@ TestResources runTestAppInUnit(string testName, string testModule, bool logAcces
     return testResources;
 }
 
-TestResources startUnit()
+TestResources startUnit() @safe
 {
     if (inNginxUnit())
         throw new Exception("Cannot start Unit while in Unit");
@@ -123,17 +128,19 @@ TestResources startUnit()
     );
 
     string[] output;
-    foreach (line; pipe.stdout.byLine)
-    {
-        output ~= line.idup;
-        if (output.back.canFind("started"))
-            break;
+    (() @trusted {
+        foreach (line; pipe.stdout.byLine) // Resists @aafe
+        {
+            output ~= line.idup;
+            if (output.back.canFind("started"))
+                break;
 
-        if (output.back.canFind("Address already in use"))
-            throw new Exception(
-                "Unit control address already in use: " ~ testResources.controlAddress()
-            );
-    }
+            if (output.back.canFind("Address already in use"))
+                throw new Exception(
+                    "Unit control address already in use: " ~ testResources.controlAddress()
+                );
+        }
+    })();
 
     auto pipeWait = pipe.pid.tryWait();
     if (pipeWait.terminated)
@@ -152,9 +159,10 @@ TestResources startUnit()
     return testResources;
 }
 
-void resetUnitConfig(TestResources testResources)
+void resetUnitConfig(TestResources testResources) @safe
 {
     writeln("Sending reset config to ", testResources.controlAddress(), "...");
+    // TODO: Switch to std.net.curl
     requestHTTP(
         "http://" ~ testResources.controlAddress() ~ "/config",
         (scope req) {
@@ -175,7 +183,7 @@ void resetUnitConfig(TestResources testResources)
     );
 }
 
-class TestResources
+@safe class TestResources
 {
     Pid unitInstance;
     InternetAddress server;
@@ -205,11 +213,12 @@ class TestResources
         scope(exit) unitInstance.wait();
         resetUnitConfig(this);
         writeln("Shutting down Unit...");
-        unitInstance.kill();
+        (() @trusted => unitInstance.kill())();
     }
 }
 
-InternetAddress getLocalAddress() {
+InternetAddress getLocalAddress() @safe
+{
     synchronized {
         InternetAddress current = initializeState();
 
@@ -218,9 +227,8 @@ InternetAddress getLocalAddress() {
         auto port = parts[1].to!uint;
 
         port = port + 10;
-        if (port > MaxPort) {
+        if (port > MaxPort)
             port = StartPort;
-        }
 
         auto next = new InternetAddress(
             format("127.0.0.%d", addressIndex),
@@ -234,11 +242,14 @@ InternetAddress getLocalAddress() {
     }
 }
 
-private InternetAddress initializeState() {
-    if (LastAddressFile.exists()) {
-        auto data = cast(string)(LastAddressFile.read());
+private InternetAddress initializeState() @safe
+{
+    if (LastAddressFile.exists())
+    {
+        auto data = (() @trusted => LastAddressFile.read().to!string())();
         auto match = data.matchFirst(r"^127\.0\.0\.(\d+):(\d+)$");
-        if (match) {
+        if (match)
+        {
             auto address = format("127.0.0.%s", match.captures[1]);
             auto port = match.captures[2].to!ushort;
             return new InternetAddress(address, port);
@@ -253,6 +264,7 @@ enum StartPort = 49152; // Dynamic ports start
 enum MaxPort = 65535; // Dynamic ports end
 enum LoopbackStart = 1;
 
-private void saveState(InternetAddress state) {
+private void saveState(InternetAddress state) @safe
+{
     LastAddressFile.write(state.toString());
 }

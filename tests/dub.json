@@ -17,6 +17,9 @@
             },
             "unit-threaded": "~>2.2.0",
             "vibe-d:http": "~>0.10.1",
-        }
+        },
+        "dflags": [
+            "--preview=dip1000",
+        ]
     }]
 }
