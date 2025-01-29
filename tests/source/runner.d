@@ -1,17 +1,20 @@
 import core.runtime : Runtime;
 import std.algorithm.searching : canFind;
 import std.conv : to;
-import std.file : thisExePath;
+import std.file : exists, read, thisExePath, write;
 import std.format : format;
 import std.json : parseJSON;
 import std.process: kill, pipeProcess, Pid, Redirect, tryWait, wait;
 import std.range : back;
-import std.socket :TcpSocket, InternetAddress;
+import std.regex : matchFirst;
+import std.socket :SocketOption, SocketOptionLevel, TcpSocket, InternetAddress;
 import std.stdio : writeln;
+import std.string : split;
 import unit_threaded;
 import vibe.http.client : requestHTTP;
 import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8;
+import std.file : exists, read, write;
 
 mixin runTestsMain!(
     __MODULE__,
@@ -22,11 +25,10 @@ mixin runTestsMain!(
 bool inNginxUnit()
 {
     auto rt = Runtime();
-    return rt.args.canFind(IN_NGINX_UNIT);
+    return rt.args.canFind(InNginxUnit);
 }
 
-enum NGINX_UNIT_DUMMY_TEST = "in-nginx-unit";
-enum IN_NGINX_UNIT = NGINX_UNIT_DUMMY_TEST;
+enum InNginxUnit = "in-nginx-unit";
 
 TestResources runTestAppInUnit(string testName, string testModule, bool logAccess = false)
 {
@@ -37,7 +39,7 @@ TestResources runTestAppInUnit(string testName, string testModule, bool logAcces
     {
         string unitConfigTemplate = `{
     "listeners": {
-        "127.0.0.1:%s": {
+        "%s": {
             "pass": "applications/%s"
         }
     },
@@ -47,7 +49,6 @@ TestResources runTestAppInUnit(string testName, string testModule, bool logAcces
             "executable": "%s",
             "arguments": [
                 "--single",
-                "--debug",
                 "%s",
                 "%s"
             ],
@@ -68,21 +69,20 @@ TestResources runTestAppInUnit(string testName, string testModule, bool logAcces
         }
         string unitConfig = format(
             unitConfigTemplate,
-            testResources.serverPort(), // application port
+            testResources.serverAddress(), // application port
             testName, // application name
             testName, // application name
             thisExePath(), // executable name
-            IN_NGINX_UNIT, // flag that we running in Nginx Unit
+            InNginxUnit, // flag that we running in Nginx Unit
             testModule ~ "." ~ testName, // unit-threaded prefixes name with test's module
             accessLogConfig
         );
         writeln("Unit config: ", unitConfig);
-
+        writeln("Sending config to ", testResources.controlAddress(), "...");
         requestHTTP(
             "http://" ~ testResources.controlAddress() ~ "/config",
             (scope req) {
                 auto jsonValue = parseJSON(unitConfig);
-                writeln("jsonValue: ", jsonValue);
                 req.method = HTTPMethod.PUT;
                 req.writeJsonBody(jsonValue);
             },
@@ -100,7 +100,7 @@ TestResources runTestAppInUnit(string testName, string testModule, bool logAcces
     }
     catch (Exception e)
     {
-        writeln("Error during request: ", e.msg);
+        writeln("Error while configuring Unit: ", e.msg);
         testResources.release();
         throw e;
     }
@@ -112,7 +112,6 @@ TestResources startUnit()
 {
     if (inNginxUnit())
         throw new Exception("Cannot start Unit while in Unit");
-
 
     auto testResources = new TestResources();
     scope(failure) testResources.release();
@@ -153,6 +152,29 @@ TestResources startUnit()
     return testResources;
 }
 
+void resetUnitConfig(TestResources testResources)
+{
+    writeln("Sending reset config to ", testResources.controlAddress(), "...");
+    requestHTTP(
+        "http://" ~ testResources.controlAddress() ~ "/config",
+        (scope req) {
+            auto jsonValue = parseJSON("{}");
+            req.method = HTTPMethod.PUT;
+            req.writeJsonBody(jsonValue);
+        },
+        (scope res) {
+            assert(
+                200 == res.statusCode,
+                format(
+                    "Reconfiguration failed (status: %s): %s",
+                    res.statusCode,
+                    res.bodyReader.readAllUTF8()
+                )
+            );
+        }
+    );
+}
+
 class TestResources
 {
     Pid unitInstance;
@@ -182,25 +204,60 @@ class TestResources
 
     void release()
     {
-        if (!inNginxUnit() && unitInstance !is null)
-        {
-            scope(exit) unitInstance.wait();
-            writeln("Shutting down Unit...");
-            unitInstance.kill();
-        }
+        if (inNginxUnit() || unitInstance is null)
+            return;
+
+        scope(exit) unitInstance.wait();
+        resetUnitConfig(this);
+        writeln("Shutting down Unit...");
+        unitInstance.kill();
     }
 }
 
 InternetAddress getLocalAddress() {
-    auto socket = new TcpSocket();
+    synchronized {
+        InternetAddress current = initializeState();
 
-    // Bind the socket to port 0 (OS will pick an available port)
-    socket.bind(new InternetAddress("127.0.0.1", 0));
+        auto parts = current.toString().split(":");
+        auto addressIndex = parts[0].split(".")[3].to!uint;
+        auto port = parts[1].to!uint;
 
-    auto assignedPort = to!ushort(socket.localAddress.toPortString());
-    auto address = new InternetAddress("127.0.0.1", assignedPort);
+        port = port + 10;
+        if (port > MaxPort) {
+            port = StartPort;
+        }
 
-    socket.close();
+        auto next = new InternetAddress(
+            format("127.0.0.%d", addressIndex),
+            cast(ushort)port
+        );
+        writeln("Next address: ", next.toString());
 
-    return address;
+        saveState(next);
+
+        return next;
+    }
+}
+
+private InternetAddress initializeState() {
+    if (LastAddressFile.exists()) {
+        auto data = cast(string)(LastAddressFile.read());
+        auto match = data.matchFirst(r"^127\.0\.0\.(\d+):(\d+)$");
+        if (match) {
+            auto address = format("127.0.0.%s", match.captures[1]);
+            auto port = match.captures[2].to!ushort;
+            return new InternetAddress(address, port);
+        }
+    }
+
+    return new InternetAddress(format("127.0.0.%s", LoopbackStart), StartPort);
+}
+
+enum LastAddressFile = "hutia-tests-last-address.txt";
+enum StartPort = 49152; // Dynamic ports start
+enum MaxPort = 65535; // Dynamic ports end
+enum LoopbackStart = 1;
+
+private void saveState(InternetAddress state) {
+    LastAddressFile.write(state.toString());
 }

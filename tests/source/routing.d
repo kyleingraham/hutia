@@ -3,7 +3,7 @@ import runner;
 import std.conv : to;
 import std.net.curl : HTTP, ThrowOnError;
 import std.traits : EnumMembers;
-import unit_threaded : shouldEqual, ShouldFail;
+import unit_threaded : shouldEqual, ShouldFail, shouldThrowWithMessage;
 import vibe.http.client : requestHTTP;
 import vibe.http.common : HTTPMethod, HTTPStatusException;
 import vibe.stream.operations : readAllUTF8;
@@ -34,11 +34,13 @@ unittest
             if (method == HTTP.Method.put || method == HTTP.Method.post)
                 client.contentLength = 0; // 411 status if omitted
 
+            client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+                statusLine.code.shouldEqual(
+                    404,
+                    "Non-GET request allowed in mapPost"
+                );
+            };
             client.perform(ThrowOnError.no);
-            client.statusLine().code.shouldEqual(
-                404, // TODO: return 405 method not allowed
-                "Non-GET request allowed in mapPost"
-            );
         }
     }
 }
@@ -65,8 +67,10 @@ unittest
             (cast(string)data).shouldEqual("Hello, World!\n");
             return data.length;
         };
+        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+            statusLine.code.shouldEqual(200, "GET request failed in mapGet");
+        };
         client.perform(ThrowOnError.no);
-        client.statusLine().code.shouldEqual(200, "GET request failed in mapGet");
     }
 }
 
@@ -92,8 +96,10 @@ unittest
             assert(0, "Received a body for a HEAD request: " ~ cast(string)data);
             return data.length;
         };
+        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+            statusLine.code.shouldEqual(200, "HEAD request failed in mapGet");
+        };
         client.perform(ThrowOnError.no);
-        client.statusLine().code.shouldEqual(200, "HEAD request failed in mapGet");
     }
 }
 
@@ -123,8 +129,10 @@ unittest
             (cast(string)data).shouldEqual(expected, "POST data did not round-trip");
             return data.length;
         };
+        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+            statusLine.code.shouldEqual(200);
+        };
         client.perform(ThrowOnError.no);
-        client.statusLine().code.shouldEqual(200);
     }
 }
 
@@ -154,11 +162,10 @@ unittest
             if (method == HTTP.Method.put)
                 client.contentLength = 0; // 411 status if omitted
 
+            client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+                statusLine.code.shouldEqual(404, "Non-POST request allowed in mapPost");
+            };
             client.perform(ThrowOnError.no);
-            client.statusLine().code.shouldEqual(
-                404,
-                "Non-POST request allowed in mapPost"
-            );
         }
     }
 }
@@ -191,11 +198,13 @@ unittest
 
             // Suppresses body logging.
             client.onReceive = (ubyte[] data) => data.length;
+            client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+                statusLine.code.shouldEqual(
+                    200,
+                    "Non-CONNECT/TRACE request rejected in map: " ~ to!string(method)
+                );
+            };
             client.perform(ThrowOnError.no);
-            client.statusLine().code.shouldEqual(
-                200,
-                "Non-CONNECT/TRACE request rejected in map: " ~ to!string(method)
-            );
         }
     }
 }
@@ -220,11 +229,70 @@ unittest
         {
             auto client = HTTP("http://" ~ testResources.serverAddress() ~ "/");
             client.method = method;
+            client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+                statusLine.code.shouldEqual(
+                    404,
+                    "CONNECT/TRACE request accepted in map: " ~ to!string(method)
+                );
+            };
             client.perform(ThrowOnError.no);
-            client.statusLine().code.shouldEqual(
-                404,
-                "CONNECT/TRACE request accepted in map: " ~ to!string(method)
-            );
         }
     }
+}
+
+enum test8 = "route-constraints-influence-route-matching";
+@(test8)
+unittest
+{
+    if (inNginxUnit())
+    {
+        auto app = WebApplication.create();
+        app.map!(() => "Hello, World!\n")("/{name}/");
+        auto rc = app.run();
+        assert(rc == 0, "App failed. Check Unit logs for details.");
+    }
+    else
+    {
+        auto testResources = runTestAppInUnit(test8, __MODULE__);
+        scope(exit) testResources.release();
+
+        auto client = HTTP("http://" ~ testResources.serverAddress() ~ "/hutia/");
+        client.method = HTTP.Method.get;
+        client.onReceive = (ubyte[] data) => data.length;
+        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+            statusLine.code.shouldEqual(200, "Route not matched as expected");
+        };
+        client.perform(ThrowOnError.no);
+        client.statusLine().code.shouldEqual(200, "Route not matched as expected");
+
+        client = HTTP("http://" ~ testResources.serverAddress() ~ "/");
+        client.method = HTTP.Method.get;
+        client.onReceive = (ubyte[] data) => data.length;
+        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+            statusLine.code.shouldEqual(404, "Route matched unexpectedly");
+        };
+        client.perform(ThrowOnError.no);
+    }
+}
+
+@("unknown-route-contraints-trigger-warnings")
+unittest
+{
+    auto app = WebApplication.create();
+    app
+    .map!(() => "Hello, World!\n")("/{name:unknown}/")
+    .shouldThrowWithMessage!ImproperlyConfigured(
+        "Route constraint for `unknown` not found"
+    );
+}
+
+@("invalid-route-contraints-trigger-warnings")
+unittest
+{
+    auto app = WebApplication.create();
+    app
+    .map!(() => "Hello, World!\n")("/{this:is:invalid}/")
+    .shouldThrowWithMessage!ImproperlyConfigured(
+        "Invalid route constraint `{this:is:invalid}`"
+    );
 }

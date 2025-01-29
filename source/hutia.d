@@ -26,6 +26,8 @@ import vibe.http.common : HTTPMethod, httpMethodFromString;
 import vibe.inet.webform : parseURLEncodedForm;
 import vibe.stream.operations : readAllUTF8;
 
+// TODO: add optional 301 redirects for non-/ request paths as middleware
+
 @safe class WebApplication
 {
     private
@@ -1065,7 +1067,7 @@ private @safe class TrieRouter {
                 }
                 else
                     throw new ImproperlyConfigured(
-                        format("Invalid route constraint %s", segment)
+                        format("Invalid route constraint `%s`", segment)
                     );
 
                 auto routeConstraintPtr = routeConstraintName in constraints;
@@ -1255,7 +1257,7 @@ private @safe class Router
                 );
             }
             else static if (
-                1 < Parameters!(handler).length
+                0 < Parameters!(handler).length
                 && is(ReturnType!handler : string)
             )
             {
@@ -1274,8 +1276,13 @@ private @safe class Router
                         // When it is left null we set it to the current handler parameter
                         // name. In both cases they can differ from the route definition.
                         // We validate in FromRoute.
+                        static assert(
+                            ParameterIdentifierTuple!handler[idx] != "",
+                            "Could not read handler parameter name.
+This can happen when using FromRoute with lambdas. Use a free function instead."
+                        );
                         args[idx] = (
-                            __traits(getAttributes, Params[idx .. idx + 1])[0].routeParameter is null ?
+                            __traits(getAttributes, Params[idx .. idx + 1])[0].routeParameter == "" ?
                             FromRoute(ParameterIdentifierTuple!handler[idx]) :
                             __traits(getAttributes, Params[idx .. idx + 1])[0]
                         ).get!(
@@ -1297,7 +1304,7 @@ private @safe class Router
                 );
             }
             else
-                static assert(0, handler, " is not a valid handler");
+                static assert(0, typeof(handler).stringof, " is not a valid handler");
         };
 
         auto methodPresent = httpMethod in routes;
