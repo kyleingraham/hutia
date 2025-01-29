@@ -193,7 +193,6 @@ unittest
             if (method == HTTP.Method.post || method == HTTP.Method.put)
                 client.contentLength = 0; // 411 status if omitted
 
-            // Suppresses body logging.
             client.onReceive = (ubyte[] data) => data.length;
             client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
                 statusLine.code.shouldEqual(

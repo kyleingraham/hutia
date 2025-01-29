@@ -1,6 +1,6 @@
 import hutia;
 import runner;
-import std.net.curl : HTTP, ThrowOnError;
+import std.net.curl : HTTP;
 import unit_threaded : shouldEqual;
 
 // Ideally all tests would be @safe but using requestHTTP
@@ -10,7 +10,7 @@ import unit_threaded : shouldEqual;
 
 enum test1 = "readToEnd-reads-whole-request-body";
 @(test1)
-unittest
+@safe unittest
 {
     if (inNginxUnit())
     {
@@ -26,24 +26,22 @@ unittest
         auto testResources = runTestAppInUnit(test1, __MODULE__);
         scope(exit) testResources.release();
 
-        auto client = HTTP("http://" ~ testResources.serverAddress() ~ "/");
-        client.method = HTTP.Method.post;
-        auto expected = "Read to end!\n";
-        client.postData = expected;
-        client.onReceive = (ubyte[] data) {
-            (cast(string)data).shouldEqual(
-                expected,
-                "readToEnd incorrectly read request body"
-            );
-            return data.length;
-        };
-        // Using callback prevents `0` statusLine that occurs
-        // when reading statusLine directly. Direct reads can
-        // sometimes occur before the request is complete.
-        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
-            statusLine.code.shouldEqual(200);
-        };
-        client.perform(ThrowOnError.no);
+        auto postData = "Read to end!\n";
+
+        makePostRequest(
+            "http://" ~ testResources.serverAddress() ~ "/",
+            postData,
+            (HTTP.StatusLine statusLine) {
+                statusLine.code.shouldEqual(200);
+            },
+            (ubyte[] data) {
+                (cast(string)data).shouldEqual(
+                    postData,
+                    "readToEnd incorrectly read request body"
+                );
+                return data.length;
+            }
+        );
     }
 }
 
@@ -54,7 +52,7 @@ string fromRouteHandler(@FromRoute() int num) @safe
 
 enum test2 = "FromRoute-conversion-error-triggers-500s";
 @(test2)
-unittest
+@safe unittest
 {
     if (inNginxUnit())
     {
@@ -68,19 +66,17 @@ unittest
         auto testResources = runTestAppInUnit(test2, __MODULE__);
         scope(exit) testResources.release();
 
-        auto client = HTTP(
-            "http://" ~ testResources.serverAddress() ~ "/1000000000000000000000000000000/")
-        ;
-        client.method = HTTP.Method.get;
-        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
-            statusLine.code.shouldEqual(500, "Route succeeded unexpectedly");
-        };
-        client.perform(ThrowOnError.no);
+        makeGetRequest(
+            "http://" ~ testResources.serverAddress() ~ "/1000000000000000000000000000000/",
+            (HTTP.StatusLine statusLine) {
+                statusLine.code.shouldEqual(500, "Route succeeded unexpectedly");
+            }
+        );
     }
 }
 
 @("FromRoute-incompatible-with-lambdas")
-unittest
+@safe unittest
 {
     // In D we don't yet have a way to read parameter names from lambda definitions.
     auto app = WebApplication.create();
@@ -97,7 +93,7 @@ string unsafeHandler() {return "Unsafe";}
 string safeHandler() @safe {return "Safe";}
 
 @("Hutia-rejects-unsafe-handlers")
-unittest
+@safe unittest
 {
     auto app = WebApplication.create();
     static assert(
@@ -129,7 +125,7 @@ string multipleFromRouteHandler(
 }
 
 @("Hutia-supports-string-returning-handlers")
-unittest
+@safe unittest
 {
     auto app = WebApplication.create();
     static assert(
@@ -148,7 +144,7 @@ unittest
 
 enum test3 = "routeValues-contains-output-from-route-constraints";
 @(test3)
-unittest
+@safe unittest
 {
     if (inNginxUnit())
     {
@@ -165,25 +161,25 @@ unittest
         auto testResources = runTestAppInUnit(test3, __MODULE__);
         scope(exit) testResources.release();
 
-        auto client = HTTP("http://" ~ testResources.serverAddress() ~ "/hutia/0/");
-        client.method = HTTP.Method.get;
-        client.onReceive = (ubyte[] data) {
-            (cast(string)data).shouldEqual(
-                "hutia 0",
-                "Did not receive expected route values"
-            );
-            return data.length;
-        };
-        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
-            statusLine.code.shouldEqual(200, "Route not matched as expected");
-        };
-        client.perform(ThrowOnError.no);
+        makeGetRequest(
+            "http://" ~ testResources.serverAddress() ~ "/hutia/0/",
+            (HTTP.StatusLine statusLine) {
+                statusLine.code.shouldEqual(200, "Route not matched as expected");
+            },
+            (ubyte[] data) {
+                (cast(string)data).shouldEqual(
+                    "hutia 0",
+                    "Did not receive expected route values"
+                );
+                return data.length;
+            }
+        );
     }
 }
 
 enum test4 = "vibed-concurrency-works";
 @(test4)
-unittest
+@safe unittest
 {
     if (inNginxUnit())
     {
@@ -203,13 +199,12 @@ unittest
         auto testResources = runTestAppInUnit(test4, __MODULE__);
         scope(exit) testResources.release();
 
-        auto client = HTTP("http://" ~ testResources.serverAddress() ~ "/");
-        client.method = HTTP.Method.get;
-        client.onReceive = (ubyte[] data) => data.length;
-        client.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
-            statusLine.code.shouldEqual(200);
-        };
-        client.perform(ThrowOnError.no);
+        makeGetRequest(
+            "http://" ~ testResources.serverAddress() ~ "/",
+            (HTTP.StatusLine statusLine) {
+                statusLine.code.shouldEqual(200);
+            }
+        );
     }
 }
 

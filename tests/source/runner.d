@@ -4,6 +4,8 @@ import std.conv : to;
 import std.file : exists, read, thisExePath, write;
 import std.format : format;
 import std.json : parseJSON;
+import std.net.curl : HTTP, put, ThrowOnError;
+import std.path : absolutePath, buildPath, dirName;
 import std.process: kill, pipeProcess, Pid, Redirect, tryWait, wait;
 import std.range : back;
 import std.regex : matchFirst;
@@ -11,9 +13,6 @@ import std.socket : InternetAddress;
 import std.stdio : writeln;
 import std.string : split;
 import unit_threaded;
-import vibe.http.client : requestHTTP;
-import vibe.http.common : HTTPMethod;
-import vibe.stream.operations : readAllUTF8;
 import std.file : exists, read, write;
 
 mixin runTestsMain!(
@@ -36,7 +35,6 @@ TestResources runTestAppInUnit(
     bool logAccess = false
 ) @safe
 {
-    import std.path : absolutePath, buildPath, dirName;
     TestResources testResources = startUnit();
 
     try
@@ -62,6 +60,7 @@ TestResources runTestAppInUnit(
     %s
 }`;
         string accessLogConfig;
+
         if (logAccess)
         {
             auto accessLogConfigTemplate = "\"access_log\": \"" ~ buildPath(
@@ -71,6 +70,7 @@ TestResources runTestAppInUnit(
             ) ~ "\"";
             accessLogConfig = format(accessLogConfigTemplate, testName);
         }
+
         string unitConfig = format(
             unitConfigTemplate,
             testResources.serverAddress(), // application port
@@ -81,27 +81,15 @@ TestResources runTestAppInUnit(
             testModule ~ "." ~ testName, // unit-threaded prefixes name with test's module
             accessLogConfig
         );
+
         writeln("Unit config: ", unitConfig);
         writeln("Sending config to ", testResources.controlAddress(), "...");
-        // TODO: Switch to std.net.curl
-        requestHTTP(
-            "http://" ~ testResources.controlAddress() ~ "/config",
-            (scope req) {
-                auto jsonValue = parseJSON(unitConfig);
-                req.method = HTTPMethod.PUT;
-                req.writeJsonBody(jsonValue);
-            },
-            (scope res) {
-                assert(
-                    200 == res.statusCode,
-                    format(
-                        "Reconfiguration failed (status: %s): %s",
-                        res.statusCode,
-                        res.bodyReader.readAllUTF8()
-                    )
-                );
-            }
-        );
+        (() @trusted {
+            auto content = put(
+                "http://" ~ testResources.controlAddress() ~ "/config",
+                unitConfig.parseJSON().toString()
+            );
+        })();
     }
     catch (Exception e)
     {
@@ -129,7 +117,7 @@ TestResources startUnit() @safe
 
     string[] output;
     (() @trusted {
-        foreach (line; pipe.stdout.byLine) // Resists @aafe
+        foreach (line; pipe.stdout.byLine) // Resists @safe
         {
             output ~= line.idup;
             if (output.back.canFind("started"))
@@ -162,25 +150,12 @@ TestResources startUnit() @safe
 void resetUnitConfig(TestResources testResources) @safe
 {
     writeln("Sending reset config to ", testResources.controlAddress(), "...");
-    // TODO: Switch to std.net.curl
-    requestHTTP(
-        "http://" ~ testResources.controlAddress() ~ "/config",
-        (scope req) {
-            auto jsonValue = parseJSON("{}");
-            req.method = HTTPMethod.PUT;
-            req.writeJsonBody(jsonValue);
-        },
-        (scope res) {
-            assert(
-                200 == res.statusCode,
-                format(
-                    "Reconfiguration failed (status: %s): %s",
-                    res.statusCode,
-                    res.bodyReader.readAllUTF8()
-                )
-            );
-        }
-    );
+    (() @trusted {
+        auto content = put(
+            "http://" ~ testResources.controlAddress() ~ "/config",
+            "{}".parseJSON().toString()
+        );
+    })();
 }
 
 @safe class TestResources
@@ -267,4 +242,63 @@ enum LoopbackStart = 1;
 private void saveState(InternetAddress state) @safe
 {
     LastAddressFile.write(state.toString());
+}
+
+void makeGetRequest(
+    string url,
+    void delegate(HTTP.StatusLine) onReceiveStatusLine = null,
+    size_t delegate(ubyte[]) onReceive = null
+) @trusted
+{
+    makeRequest(
+        url,
+        HTTP.Method.get,
+        onReceiveStatusLine,
+        onReceive
+    );
+}
+
+void makePostRequest(
+    string url,
+    const(void)[] postData,
+    void delegate(HTTP.StatusLine) onReceiveStatusLine = null,
+    size_t delegate(ubyte[]) onReceive = null
+) @trusted
+{
+    makeRequest(
+        url,
+        HTTP.Method.post,
+        onReceiveStatusLine,
+        onReceive,
+        postData
+    );
+}
+
+void makeRequest(
+    string url,
+    HTTP.Method method,
+    void delegate(HTTP.StatusLine) onReceiveStatusLine = null,
+    size_t delegate(ubyte[]) onReceive = null,
+    const(void)[] postData = null
+) @trusted
+{
+    auto client = HTTP(url);
+    client.method = method;
+
+    if (postData !is null)
+        client.postData = postData;
+
+    if (onReceive !is null)
+        client.onReceive = onReceive;
+    else
+        // Suppresses body logging.
+        client.onReceive = (ubyte[] data) => data.length;
+
+    // Using callback prevents `0` statusLine that occurs
+    // when reading statusLine directly. Direct reads can
+    // sometimes occur before the request is complete.
+    if (onReceiveStatusLine !is null)
+        client.onReceiveStatusLine = onReceiveStatusLine;
+
+    client.perform(ThrowOnError.no);
 }
